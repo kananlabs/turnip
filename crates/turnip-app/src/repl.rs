@@ -324,9 +324,9 @@ impl Repl {
         let width = self.terminal.size().0;
         let mut lines = self.input_lines(width);
         lines.push(self.footer_line(width));
-        let cursor = self.input_cursor();
+        let (row, column) = self.input_cursor_position(width);
         let _ = self.terminal.render_region(&lines);
-        let _ = self.terminal.cursor_in_region(1, cursor as u16 + PROMPT.chars().count() as u16);
+        let _ = self.terminal.cursor_in_region(row as u16, column as u16);
     }
 
     fn input_lines(&self, width: usize) -> Vec<StyledLine> {
@@ -352,10 +352,28 @@ impl Repl {
     }
 
     /// Display-column offset of the cursor within the input line.
-    fn input_cursor(&self) -> usize {
+    /// The input cursor's (row, column) within the rendered input area,
+    /// where row 0 is the first input line. Earlier logical lines contribute
+    /// their wrapped rows so multi-line input and long wrapped lines stay
+    /// navigable.
+    fn input_cursor_position(&self, width: usize) -> (usize, usize) {
+        let prompt_width = PROMPT.chars().count();
+        let width = width.max(prompt_width + 4);
         let before_cursor = &self.editor.text[..self.editor.cursor];
-        let current_line = before_cursor.rsplit('\n').next().unwrap_or("");
-        PROMPT.chars().count() + turnip_core::text::str_width(current_line)
+        let cursor_line = before_cursor.matches('\n').count();
+        let current = before_cursor.rsplit('\n').next().unwrap_or("");
+
+        let mut row = 0usize;
+        for (index, line) in self.editor.text.split('\n').enumerate() {
+            if index >= cursor_line {
+                break;
+            }
+            let prefix = if index == 0 { prompt_width } else { 2 };
+            row += rows_for(prefix, line, width);
+        }
+        let prefix = if cursor_line == 0 { prompt_width } else { 2 };
+        let column = prefix + turnip_core::text::str_width(current);
+        (row, column.min(width.saturating_sub(1)))
     }
 
     fn footer_line(&self, width: usize) -> StyledLine {
@@ -1315,6 +1333,11 @@ fn tool_argument_display(name: &str, arguments: &str) -> String {
         Some(text) => turnip_core::text::truncate_columns(text, 48),
         None => turnip_core::text::truncate_columns(arguments, 48),
     }
+}
+
+/// Display rows a rendered logical line occupies at the given width.
+fn rows_for(prefix: usize, line: &str, width: usize) -> usize {
+    turnip_core::text::wrap_line(&format!("{}{}", " ".repeat(prefix), line), width).len().max(1)
 }
 
 /// Compact "in 1.2k · out 340" style token totals.

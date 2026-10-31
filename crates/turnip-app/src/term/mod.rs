@@ -99,6 +99,9 @@ pub struct Terminal {
     enabled: bool,
     /// Lines currently occupied by the live region (for redraw/erase).
     region_lines: usize,
+    /// Row (from the region top) where the cursor currently sits, so the
+    /// write invariant can be restored before the next region operation.
+    cursor_row: u16,
     /// Events read but not yet consumed (e.g. pastes waiting behind keys).
     pending: std::collections::VecDeque<TermEvent>,
 }
@@ -115,6 +118,7 @@ impl Terminal {
         Ok(Terminal {
             enabled: true,
             region_lines: 0,
+            cursor_row: 0,
             pending: std::collections::VecDeque::new(),
         })
     }
@@ -127,10 +131,17 @@ impl Terminal {
 
     /// Write finished lines into the scrollback, above the live region.
     /// `lines` must contain no newlines. Returns the number written.
+    ///
+    /// The invariant everywhere is: **the cursor sits at the live region's
+    /// top whenever the terminal is asked to write**. The caller may move it
+    /// into the region with [`Terminal::cursor_in_region`]; this first walks
+    /// back up, then writes the lines from the region top, so the region
+    /// shifts down intact and the pushed lines land just above it.
     pub fn push_lines(&mut self, lines: &[StyledLine]) -> io::Result<usize> {
         if lines.is_empty() {
             return Ok(0);
         }
+        self.restore_to_top()?;
         let (width, _) = self.size();
         let mut stdout = io::stdout();
         for line in lines {
@@ -142,20 +153,24 @@ impl Terminal {
     }
 
     /// Replace the live region with `lines` (no embedded newlines; wrapping
-    /// is applied per line). The cursor ends at the end of the region.
+    /// is applied per line). Leaves the cursor at the region's top, keeping
+    /// the write invariant for the next call.
     pub fn render_region(&mut self, lines: &[StyledLine]) -> io::Result<()> {
+        self.restore_to_top()?;
+        let old_lines = self.region_lines;
         let mut stdout = io::stdout();
-        // Erase the previous region: cursor is at its top.
-        for index in 0..self.region_lines {
+        // Erase the previous region, walking its rows from the top.
+        for index in 0..old_lines {
             if index > 0 {
                 stdout.write_all(b"\r\n")?;
             }
             execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(terminal::ClearType::UntilNewLine))?;
         }
-        // Return the cursor to the region top.
-        if self.region_lines > 1 {
-            execute!(stdout, cursor::MoveUp(self.region_lines as u16 - 1))?;
+        // Walk back to the region top.
+        if old_lines > 1 {
+            execute!(stdout, cursor::MoveUp(old_lines as u16 - 1))?;
         }
+
         let (width, _) = self.size();
         for (index, line) in lines.iter().enumerate() {
             if index > 0 {
@@ -164,32 +179,44 @@ impl Terminal {
             execute!(stdout, cursor::MoveToColumn(0))?;
             stdout.write_all(line.render(width).as_bytes())?;
         }
-        // Erase the tail of the previous region that the new one does not cover.
-        if self.region_lines > lines.len() {
-            let leftover = self.region_lines - lines.len();
+
+        // Erase rows of the previous region the new one does not cover.
+        let leftover = old_lines.saturating_sub(lines.len());
+        for _ in 0..leftover {
             stdout.write_all(b"\r\n")?;
             execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-            for _ in 1..leftover {
-                stdout.write_all(b"\r\n")?;
-                execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-            }
+        }
+        if leftover > 0 {
             execute!(stdout, cursor::MoveUp(leftover as u16))?;
         }
-        stdout.flush()?;
+
         self.region_lines = lines.len().max(1);
+        self.cursor_row = 0;
+        stdout.flush()?;
+        // Park the cursor at the region top so the next write starts there.
+        if self.region_lines > 1 {
+            execute!(io::stdout(), cursor::MoveUp(self.region_lines as u16 - 1))?;
+        }
         Ok(())
     }
 
     /// Place the cursor at (row, column) within the current region, where
-    /// row 0 is the region's last line.
-    pub fn cursor_in_region(&mut self, row_from_bottom: u16, column: u16) -> io::Result<()> {
+    /// row 0 is the region's top line. The terminal remembers the row so
+    /// the next region write can restore the invariant.
+    pub fn cursor_in_region(&mut self, row_from_top: u16, column: u16) -> io::Result<()> {
         let mut stdout = io::stdout();
-        if self.region_lines > 1 {
-            let up = (self.region_lines as u16 - 1).saturating_sub(row_from_bottom);
-            execute!(stdout, cursor::MoveUp(up))?;
-        }
-        execute!(stdout, cursor::MoveToColumn(column))?;
+        execute!(stdout, cursor::MoveDown(row_from_top), cursor::MoveToColumn(column))?;
+        self.cursor_row = row_from_top;
         stdout.flush()
+    }
+
+    /// Walk the cursor back to the live region's top.
+    fn restore_to_top(&mut self) -> io::Result<()> {
+        if self.cursor_row > 0 {
+            execute!(io::stdout(), cursor::MoveUp(self.cursor_row))?;
+            self.cursor_row = 0;
+        }
+        Ok(())
     }
 
     pub fn hide_cursor(&mut self) -> io::Result<()> {
@@ -246,6 +273,14 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if self.enabled {
+            let _ = self.restore_to_top();
+            if self.region_lines > 1 {
+                let _ = execute!(
+                    io::stdout(),
+                    cursor::MoveDown(self.region_lines as u16 - 1)
+                );
+            }
+            let _ = io::stdout().write_all(b"\r\n");
             let _ = execute!(
                 io::stdout(),
                 cursor::Show,

@@ -91,7 +91,8 @@ pub fn pick(
         };
         lines.push(StyledLine::styled(count_note, LineStyle { dim: true, ..Default::default() }));
         terminal.render_region(&lines)?;
-        terminal.cursor_in_region(1, 1 + filter.chars().count() as u16)?;
+        let filter_width = turnip_core::text::str_width(&filter);
+        terminal.cursor_in_region(1, 1 + filter_width as u16)?;
 
         // Input loop.
         let event = loop {
