@@ -154,12 +154,15 @@ fn push_code_block(lines: &mut Vec<StyledLine>, code: &[String], lang: &str, wid
         },
     ));
     for line in code {
-        // Code keeps its exact spacing: hard-wrap instead of reflowing on
-        // spaces, which would eat the indentation.
-        for wrapped in super::region::wrap_line(line, width.saturating_sub(4)) {
+        // Code sits flush at the left edge — no gutter, no added
+        // indentation — so a block copies straight out of the terminal;
+        // the header and footer above and below delimit it. Hard-wrap
+        // keeps the exact spacing, at the full width now that no gutter
+        // claims columns.
+        for wrapped in super::region::wrap_line(line, width) {
             lines.push(
                 StyledLine::styled(
-                    format!("│ {wrapped}"),
+                    wrapped,
                     LineStyle {
                         code: true,
                         ..Default::default()
@@ -312,9 +315,9 @@ mod tests {
 
     #[test]
     fn fenced_code_hard_wraps_without_dropping_spaces() {
-        let lines = render("```\nab cd ef\n```", 9);
-        assert_eq!(lines[1].text, "│ ab cd");
-        assert_eq!(lines[2].text, "│  ef");
+        let lines = render("```\nab cd ef\n```", 5);
+        assert_eq!(lines[1].text, "ab cd");
+        assert_eq!(lines[2].text, " ef");
     }
 
     #[test]
@@ -348,20 +351,24 @@ mod tests {
         assert_eq!(texts[0], "para");
         assert_eq!(texts[1], "");
         assert!(texts[2].starts_with("┌─ rust"));
-        assert_eq!(texts[3], "│ a");
-        assert_eq!(texts[4], "│ ");
-        assert_eq!(texts[5], "│ b");
+        assert_eq!(texts[3], "a");
+        assert_eq!(texts[4], "");
+        assert_eq!(texts[5], "b");
         assert!(texts[6].starts_with("└"));
         assert_eq!(texts[7], "after");
     }
 
     #[test]
     fn renders_code_blocks() {
-        let text = "before\n```rust\nfn main() {}\n```\nafter";
+        let text = "before\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\nafter";
         let lines = render(text, 40);
         let joined: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
         assert!(joined.iter().any(|l| l.starts_with("┌─ rust")));
-        assert!(joined.iter().any(|l| *l == "│ fn main() {}"));
+        // Contents are flush left and keep their indentation, so they
+        // copy straight out of the terminal.
+        assert!(joined.iter().any(|l| *l == "fn main() {"));
+        assert!(joined.iter().any(|l| *l == "    println!(\"hi\");"));
+        assert!(joined.iter().any(|l| *l == "}"));
         assert!(joined.iter().any(|l| l.starts_with("└")));
         assert_eq!(*joined.last().unwrap(), "after");
     }

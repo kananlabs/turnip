@@ -55,6 +55,9 @@ available one; `/provider` and `/model` switch live, interactively.
   from its output — while reasoning streams as dimmed italics and
   markdown paragraphs keep single blank-line breaks whatever the stream
   chunk boundaries cut them at.
+- Fenced code blocks keep their dim header and footer but their contents
+  sit flush at the terminal's left edge — no gutter, no added indentation
+  — so code copies straight out of the scrollback.
 - Ctrl+C interrupts the running turn (cooperatively, through the whole stack:
   stream, retry backoff, and running tool processes). Type-ahead while
   streaming; the submitted line queues for the next turn.
