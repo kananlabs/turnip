@@ -13,9 +13,19 @@ use turnip_core::tools::{ToolEnv, ToolRegistry};
 use turnip_core::{Config, AgentSession};
 
 use crate::bootstrap::App;
-use crate::term::{markdown, picker, LineEditor, LineStyle, StyledLine, Terminal};
+use crate::term::{markdown, picker, LineEditor, LineStyle, StyledLine, Terminal, PROMPT};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The stream channels that write to the scrollback during a turn. Blocks
+/// of different kinds are separated by exactly one blank line, whatever
+/// the chunk boundaries cut them at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Assistant,
+    Reasoning,
+    Tool,
+}
 
 /// The interactive frontend.
 pub struct Repl {
@@ -49,6 +59,10 @@ struct RenderState {
     spinner: usize,
     interrupted: bool,
     last_render: Option<Instant>,
+    /// Channel of the block that wrote to the scrollback last, and whether
+    /// it ended on a blank line.
+    last_channel: Option<Channel>,
+    last_blank: bool,
 }
 
 struct ToolView {
@@ -71,6 +85,8 @@ impl RenderState {
             spinner: 0,
             interrupted: false,
             last_render: None,
+            last_channel: None,
+            last_blank: false,
         }
     }
 
@@ -85,6 +101,8 @@ impl RenderState {
         self.interrupted = false;
         self.turn_started = Instant::now();
         self.last_render = None;
+        self.last_channel = None;
+        self.last_blank = false;
     }
 }
 
@@ -237,6 +255,20 @@ impl Repl {
         }
         let history = session::history_append(&self.cwd, &expanded);
         self.editor.history = history;
+        // Echo the turn into the scrollback — one separating blank line,
+        // then the prompt marked like the input line — so user turns stay
+        // visible and read apart from the assistant stream, tool blocks,
+        // and reasoning that follow.
+        let accent = LineStyle {
+            accent: true,
+            ..Default::default()
+        };
+        let mut echo = vec![StyledLine::plain("")];
+        for (index, line) in expanded.split('\n').enumerate() {
+            let marker = if index == 0 { PROMPT } else { "  " };
+            echo.push(StyledLine::styled(format!("{marker}{line}"), accent));
+        }
+        let _ = self.terminal.push_lines(&echo);
         self.run_turn();
     }
 
@@ -933,17 +965,21 @@ impl<'a> TurnRenderer<'a> {
     fn flush_stream(&mut self) {
         let (tail_start, _) = markdown::split_for_flush(&self.state.stream_text);
         if tail_start > self.state.flushed_chars {
-            let chunk = self.state.stream_text[self.state.flushed_chars..tail_start].to_string();
-            if self.markdown {
-                self.push_scrollback(markdown::render(&chunk, self.terminal_width()));
-            } else {
-                for line in chunk.split('\n') {
-                    self.push_scrollback(vec![StyledLine::plain(line)]);
-                }
+            let mut chunk =
+                self.state.stream_text[self.state.flushed_chars..tail_start].to_string();
+            // A blank line the chunk ends on is held in the tail: the next
+            // chunk renders it as the break before it, and `finish` drops
+            // it when the stream ends there. Committing it now would
+            // leave a stray blank line at every flush boundary.
+            let committed = chunk.len() - trailing_break_len(&chunk);
+            chunk.truncate(committed);
+            if !chunk.is_empty() {
+                let lines = self.text_lines(&chunk);
+                self.commit_block(Channel::Assistant, lines);
             }
-            self.state.flushed_chars = tail_start;
+            self.state.flushed_chars += committed;
         }
-        // Reasoning lines flush the same way, dimmed.
+        // Reasoning lines flush the same way, as a dimmed italic aside.
         if self.state.reasoning_text.len() > self.state.reasoning_flushed {
             let complete = self.state.reasoning_text.rsplit('\n').count();
             if self.state.reasoning_text.ends_with('\n') || complete > 1 {
@@ -956,19 +992,90 @@ impl<'a> TurnRenderer<'a> {
                     .map(|(index, _)| index + 1)
                     .unwrap_or(self.state.reasoning_text.len());
                 if safe > self.state.reasoning_flushed {
-                    let chunk = self.state.reasoning_text[self.state.reasoning_flushed..safe].to_string();
-                    for line in chunk.split('\n') {
-                        if !line.is_empty() {
-                            self.push_scrollback(vec![StyledLine::styled(
-                                format!("│ {line}"),
-                                LineStyle { dim: true, ..Default::default() },
-                            )]);
-                        }
-                    }
+                    let chunk =
+                        self.state.reasoning_text[self.state.reasoning_flushed..safe].to_string();
+                    let aside = LineStyle {
+                        dim: true,
+                        italic: true,
+                        ..Default::default()
+                    };
+                    let lines: Vec<StyledLine> = chunk
+                        .split('\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| StyledLine::styled(line.to_string(), aside))
+                        .collect();
+                    self.commit_block(Channel::Reasoning, lines);
                     self.state.reasoning_flushed = safe;
                 }
             }
         }
+    }
+
+    /// Render a chunk of assistant text into lines for the scrollback.
+    fn text_lines(&self, chunk: &str) -> Vec<StyledLine> {
+        if self.markdown {
+            markdown::render(chunk, self.terminal_width())
+        } else {
+            chunk.lines().map(StyledLine::plain).collect()
+        }
+    }
+
+    /// Commit one block of stream output to the scrollback, keeping the
+    /// separation between message kinds exact: blocks of a different
+    /// channel open with one blank line, a paragraph break split across
+    /// chunks lands as one line, never two, and a block never doubles one.
+    fn commit_block(&mut self, channel: Channel, mut lines: Vec<StyledLine>) {
+        let changed_channel = self.state.last_channel.is_some_and(|last| last != channel);
+        if self.state.last_blank || changed_channel {
+            // The break this block opens with is already on screen, or the
+            // separator below supplies it; do not write it twice.
+            let leading = lines.iter().take_while(|l| l.text.is_empty()).count();
+            lines.drain(..leading);
+        }
+        if lines.is_empty() {
+            return;
+        }
+        if changed_channel && !self.state.last_blank {
+            lines.insert(0, StyledLine::plain(""));
+        }
+        self.state.last_channel = Some(channel);
+        self.state.last_blank = lines.last().is_some_and(|l| l.text.is_empty());
+        self.push_scrollback(lines);
+    }
+
+    /// Commit a finished tool block: the call line, then a preview of its
+    /// result — the tail of what streamed live (process output, diff
+    /// previews), or the head of the model-facing result when nothing
+    /// streamed (file reads, errors).
+    fn commit_tool_view(&mut self, tool: &ToolView, summary: &str) {
+        let width = self.terminal_width();
+        let mut lines = vec![StyledLine::styled(
+            format!("▸ {}({})", tool.name, tool.argument),
+            LineStyle {
+                accent: true,
+                ..Default::default()
+            },
+        )];
+        let shown: Vec<&str> = if tool.output.trim().is_empty() {
+            summary.lines().take(3).collect()
+        } else {
+            let mut tail: Vec<&str> = tool.output.lines().rev().take(15).collect();
+            tail.reverse();
+            tail
+        };
+        for line in shown {
+            lines.push(StyledLine::styled(
+                format!(
+                    "  {}",
+                    turnip_core::text::truncate_columns(line, width.saturating_sub(4))
+                ),
+                LineStyle {
+                    dim: true,
+                    ..Default::default()
+                },
+            ));
+        }
+        self.commit_block(Channel::Tool, lines);
     }
 
     fn terminal_width(&self) -> usize {
@@ -1002,11 +1109,16 @@ impl<'a> TurnRenderer<'a> {
         }
         // Open reasoning buffer.
         if self.show_reasoning {
-            let pending = &self.state.reasoning_text[self.state.reasoning_flushed.min(self.state.reasoning_text.len())..];
+            let pending = &self.state.reasoning_text
+                [self.state.reasoning_flushed.min(self.state.reasoning_text.len())..];
             if !pending.is_empty() {
                 lines.push(StyledLine::styled(
-                    format!("│ {}", pending.lines().last().unwrap_or("")),
-                    LineStyle { dim: true, ..Default::default() },
+                    pending.lines().last().unwrap_or("").to_string(),
+                    LineStyle {
+                        dim: true,
+                        italic: true,
+                        ..Default::default()
+                    },
                 ));
             }
         }
@@ -1014,13 +1126,23 @@ impl<'a> TurnRenderer<'a> {
         if let Some(tool) = &self.state.tool {
             lines.push(StyledLine::styled(
                 format!("▸ {}({})", tool.name, tool.argument),
-                LineStyle { accent: true, ..Default::default() },
+                LineStyle {
+                    accent: true,
+                    ..Default::default()
+                },
             ));
-            let tail_lines: Vec<&str> = tool.output.lines().rev().take(6).collect();
-            for line in tail_lines.into_iter().rev() {
+            let mut tail: Vec<&str> = tool.output.lines().rev().take(6).collect();
+            tail.reverse();
+            for line in tail {
                 lines.push(StyledLine::styled(
-                    format!("  {}", turnip_core::text::truncate_columns(line, width.saturating_sub(4))),
-                    LineStyle { dim: true, ..Default::default() },
+                    format!(
+                        "  {}",
+                        turnip_core::text::truncate_columns(line, width.saturating_sub(4))
+                    ),
+                    LineStyle {
+                        dim: true,
+                        ..Default::default()
+                    },
                 ));
             }
         }
@@ -1098,43 +1220,35 @@ impl<'a> TurnRenderer<'a> {
     /// Flush everything and reset the live region; returns the outcome.
     fn finish(&mut self, outcome: TurnOutcome) -> TurnOutcome {
         self.flush_stream();
-        // Anything still unflushed goes out now.
+        // Anything still unflushed goes out now; a break the stream ended on
+        // is dropped so the transcript never ends in a blank line.
         if self.state.flushed_chars < self.state.stream_text.len() {
             let remainder = self.state.stream_text[self.state.flushed_chars..].to_string();
-            if self.markdown {
-                self.push_scrollback(markdown::render(&remainder, self.terminal_width()));
-            } else {
-                for line in remainder.split('\n') {
-                    self.push_scrollback(vec![StyledLine::plain(line)]);
-                }
+            let mut lines = self.text_lines(&remainder);
+            while lines.last().is_some_and(|l| l.text.is_empty()) {
+                lines.pop();
             }
+            self.commit_block(Channel::Assistant, lines);
             self.state.flushed_chars = self.state.stream_text.len();
         }
         if self.show_reasoning && self.state.reasoning_flushed < self.state.reasoning_text.len() {
             let remainder = self.state.reasoning_text[self.state.reasoning_flushed..].to_string();
-            if let Some(last) = remainder.lines().last() {
-                if !last.is_empty() {
-                    self.push_scrollback(vec![StyledLine::styled(
-                        format!("│ {last}"),
-                        LineStyle { dim: true, ..Default::default() },
-                    )]);
-                }
-            }
+            let aside = LineStyle {
+                dim: true,
+                italic: true,
+                ..Default::default()
+            };
+            let lines: Vec<StyledLine> = remainder
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| StyledLine::styled(line.to_string(), aside))
+                .collect();
+            self.commit_block(Channel::Reasoning, lines);
             self.state.reasoning_flushed = self.state.reasoning_text.len();
         }
+        // A tool still open (interrupted mid-run) closes its block too.
         if let Some(tool) = self.state.tool.take() {
-            let width = self.terminal_width();
-            self.push_scrollback(vec![StyledLine::styled(
-                format!("▸ {}({})", tool.name, tool.argument),
-                LineStyle { accent: true, ..Default::default() },
-            )]);
-            let tail: Vec<&str> = tool.output.lines().rev().take(15).collect();
-            for line in tail.into_iter().rev() {
-                self.push_scrollback(vec![StyledLine::styled(
-                    format!("  {}", turnip_core::text::truncate_columns(line, width.saturating_sub(4))),
-                    LineStyle { dim: true, ..Default::default() },
-                )]);
-            }
+            self.commit_tool_view(&tool, "");
         }
         let _ = self.terminal.render_region(&[StyledLine::plain("")]);
         outcome
@@ -1208,26 +1322,7 @@ impl<'a> TurnHooks for TurnRenderer<'a> {
 
     fn on_tool_end(&mut self, call: &agent::PendingCallView, output: &str) {
         if let Some(tool) = self.state.tool.take() {
-            let width = self.terminal_width();
-            self.push_scrollback(vec![StyledLine::styled(
-                format!("▸ {}({})", tool.name, tool.argument),
-                LineStyle { accent: true, ..Default::default() },
-            )]);
-            let mut shown: Vec<&str> = tool.output.lines().rev().take(15).collect();
-            shown.reverse();
-            for line in shown {
-                self.push_scrollback(vec![StyledLine::styled(
-                    format!("  {}", turnip_core::text::truncate_columns(line, width.saturating_sub(4))),
-                    LineStyle { dim: true, ..Default::default() },
-                )]);
-            }
-            // The model-facing summary is compact and always shown.
-            for line in output.lines().take(3) {
-                self.push_scrollback(vec![StyledLine::styled(
-                    format!("  {line}"),
-                    LineStyle { dim: true, ..Default::default() },
-                )]);
-            }
+            self.commit_tool_view(&tool, output);
         }
         let _ = call;
     }
@@ -1262,6 +1357,23 @@ impl<'a> TurnHooks for TurnRenderer<'a> {
             LineStyle { dim: true, ..Default::default() },
         )]);
     }
+}
+
+/// Length of the trailing blank lines at the end of a flushed chunk. Each
+/// is a bare `\n` (its line ending is the newline before it), so a chunk
+/// ending on a paragraph break holds exactly its trailing newline run.
+fn trailing_break_len(chunk: &str) -> usize {
+    let bytes = chunk.as_bytes();
+    let mut len = 0;
+    while len < bytes.len() {
+        let at = bytes.len() - len - 1;
+        if bytes[at] == b'\n' && (at == 0 || bytes[at - 1] == b'\n') {
+            len += 1;
+        } else {
+            break;
+        }
+    }
+    len
 }
 
 /// A short single-argument display for the tool call line.
@@ -1386,6 +1498,16 @@ fn print_banner(terminal: &mut Terminal, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailing_breaks_hold_only_bare_blank_lines() {
+        assert_eq!(trailing_break_len("para\n"), 0);
+        // A chunk ending on a paragraph break holds exactly its blank line.
+        assert_eq!(trailing_break_len("para\n\n"), 1);
+        // A chunk of nothing but breaks holds all of it.
+        assert_eq!(trailing_break_len("\n"), 1);
+        assert_eq!(trailing_break_len("\n\n\n"), 3);
+    }
 
     #[test]
     fn mention_expansion_resolves_existing_paths() {

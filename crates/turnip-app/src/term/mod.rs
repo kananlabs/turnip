@@ -40,6 +40,7 @@ pub struct LineStyle {
     pub error: bool,
     pub warning: bool,
     pub code: bool,
+    pub italic: bool,
 }
 
 impl StyledLine {
@@ -66,6 +67,9 @@ impl StyledLine {
         if self.style.bold {
             out.push_str(&style::Attribute::Bold.to_string());
         }
+        if self.style.italic {
+            out.push_str(&style::Attribute::Italic.to_string());
+        }
         if self.style.accent {
             out.push_str(&style::SetForegroundColor(style::Color::DarkCyan).to_string());
         } else if self.style.error {
@@ -76,7 +80,7 @@ impl StyledLine {
             out.push_str(&style::SetForegroundColor(style::Color::Grey).to_string());
         }
         out.push_str(&self.text);
-        if self.style.dim || self.style.bold {
+        if self.style.dim || self.style.bold || self.style.italic {
             out.push_str(&style::Attribute::Reset.to_string());
         }
         if self.style.accent || self.style.error || self.style.warning || self.style.code {
@@ -370,7 +374,19 @@ impl LineEditor {
                 }
                 position = (row, column);
             }
-            lines.extend(wrapped.into_iter().map(StyledLine::plain));
+            let first_row = index == 0;
+            lines.extend(wrapped.into_iter().enumerate().map(|(row, text)| {
+                // The prompt row carries the input's identity: accent, like
+                // the echo a submitted turn leaves in the scrollback.
+                if first_row && row == 0 {
+                    StyledLine::styled(text, LineStyle {
+                        accent: true,
+                        ..Default::default()
+                    })
+                } else {
+                    StyledLine::plain(text)
+                }
+            }));
             offset += raw.len() + 1;
         }
         while lines.len() <= position.0 {

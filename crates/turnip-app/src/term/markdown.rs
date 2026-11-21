@@ -8,13 +8,26 @@ use super::{StyledLine, LineStyle};
 /// `width` display columns. Supports what streams actually contain: fenced
 /// code blocks, headings, bullet and numbered lists, block quotes, inline
 /// code, bold, and links.
+///
+/// Built for newline-terminated streaming chunks: a trailing newline ends
+/// the last line instead of opening a stray empty one (so consecutive flushes
+/// never stack blank lines), and runs of blank lines collapse into the
+/// single break that separates paragraphs. A break the chunk ends on is
+/// kept — the text that follows in the next chunk continues under it —
+/// while code fences preserve blank lines verbatim.
 pub fn render(text: &str, width: usize) -> Vec<StyledLine> {
     let mut lines = Vec::new();
     let mut in_code = false;
     let mut code_lang = String::new();
     let mut code_lines: Vec<String> = Vec::new();
+    // A paragraph break waits for the content it separates; it is written
+    // once, before whatever follows it.
+    let mut pending_break = false;
 
-    for raw in text.split('\n') {
+    // The newline that ends the last line is a line ending, not an empty
+    // line of its own.
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    for raw in body.split('\n') {
         let trimmed = raw.trim_start();
         let indent = raw.len() - trimmed.len();
         let indent: String = " ".repeat(indent.min(16));
@@ -26,18 +39,27 @@ pub fn render(text: &str, width: usize) -> Vec<StyledLine> {
                 code_lang.clear();
                 in_code = false;
             } else {
+                if pending_break {
+                    lines.push(StyledLine::plain(""));
+                    pending_break = false;
+                }
                 in_code = true;
                 code_lang = trimmed.trim_start_matches('`').trim().to_string();
             }
             continue;
         }
         if in_code {
+            // Inside a fence, blank lines are content.
             code_lines.push(raw.to_string());
             continue;
         }
         if trimmed.is_empty() {
-            lines.push(StyledLine::plain(""));
+            pending_break = true;
             continue;
+        }
+        if pending_break {
+            lines.push(StyledLine::plain(""));
+            pending_break = false;
         }
         // Headings.
         if let Some(rest) = trimmed.strip_prefix("###") {
@@ -109,7 +131,19 @@ pub fn render(text: &str, width: usize) -> Vec<StyledLine> {
     }
 
     if !code_lines.is_empty() || in_code {
+        if pending_break {
+            lines.push(StyledLine::plain(""));
+            pending_break = false;
+        }
+        // A fence still open ends mid-stream: close the box where it
+        // stands, so the live region (and a finished remainder) shows an
+        // open block instead of losing it.
         push_code_block(&mut lines, &code_lines, &code_lang, width);
+    }
+    // A break the chunk ends on is kept: it separates this chunk from the
+    // one that follows. (`Repl::finish` trims it from a final remainder.)
+    if pending_break {
+        lines.push(StyledLine::plain(""));
     }
     lines
 }
@@ -128,7 +162,9 @@ fn push_code_block(lines: &mut Vec<StyledLine>, code: &[String], lang: &str, wid
         },
     ));
     for line in code {
-        for wrapped in turnip_core::text::wrap_line(line, width.saturating_sub(4)) {
+        // Code keeps its exact spacing: hard-wrap instead of reflowing on
+        // spaces, which would eat the indentation.
+        for wrapped in super::region::wrap_line(line, width.saturating_sub(4)) {
             lines.push(StyledLine::styled(
                 format!("│ {wrapped}"),
                 LineStyle {
@@ -256,6 +292,44 @@ mod tests {
         assert_eq!(lines[2].text, "plain bold text");
         assert_eq!(lines[4].text, "• item one");
         assert_eq!(lines[7].text, "1. first");
+    }
+
+    #[test]
+    fn newline_terminated_chunks_commit_no_stray_blank() {
+        // Flushes are newline-terminated; a trailing newline must not
+        // open an empty line, or every flush would stack a blank row.
+        fn texts(text: &str) -> Vec<String> {
+            render(text, 40).iter().map(|l| l.text.clone()).collect()
+        }
+        assert_eq!(texts("one\n"), vec!["one"]);
+        assert_eq!(texts("one\n\ntwo\n"), vec!["one", "", "two"]);
+        // A chunk that is nothing but the paragraph break itself commits
+        // exactly one blank line, not two.
+        assert_eq!(texts("\n"), vec![""]);
+    }
+
+    #[test]
+    fn blank_runs_collapse_to_one_break() {
+        fn texts(text: &str) -> Vec<String> {
+            render(text, 40).iter().map(|l| l.text.clone()).collect()
+        }
+        assert_eq!(texts("a\n\n\n\nb"), vec!["a", "", "b"]);
+        // A break the chunk ends on is kept for the chunk that follows.
+        assert_eq!(texts("a\n\n"), vec!["a", ""]);
+    }
+
+    #[test]
+    fn fences_keep_their_blank_lines_verbatim() {
+        let lines = render("para\n\n```rust\na\n\nb\n```\nafter\n", 40);
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts[0], "para");
+        assert_eq!(texts[1], "");
+        assert!(texts[2].starts_with("┌─ rust"));
+        assert_eq!(texts[3], "│ a");
+        assert_eq!(texts[4], "│ ");
+        assert_eq!(texts[5], "│ b");
+        assert!(texts[6].starts_with("└"));
+        assert_eq!(texts[7], "after");
     }
 
     #[test]

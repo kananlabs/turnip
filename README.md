@@ -47,6 +47,12 @@ available one; `/provider` and `/model` switch live, interactively.
 
 - Streaming markdown rendered line-by-line into native scrollback; only a
   bounded live region (streaming tail, status, input) is redrawn.
+- The transcript reads in distinct blocks: submitted prompts are echoed as
+  `› …` (accented, like the input prompt) with one blank line between
+  turns; tool calls and results commit as `▸ tool(arg)` blocks with a
+  dimmed result preview; reasoning streams as dimmed italics; and
+  markdown paragraphs keep single blank-line breaks whatever the stream
+  chunk boundaries cut them at.
 - Ctrl+C interrupts the running turn (cooperatively, through the whole stack:
   stream, retry backoff, and running tool processes). Type-ahead while
   streaming; the submitted line queues for the next turn.
