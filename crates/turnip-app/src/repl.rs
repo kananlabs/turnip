@@ -184,6 +184,19 @@ impl Repl {
         if repl.session.model.is_none() {
             repl.pick_model()?;
         }
+
+        // hax records every conversation: attach a fresh session log when
+        // recording is on and nothing was resumed or forked. The file is
+        // materialized lazily on the first recorded item, so an idle REPL
+        // leaves no file behind.
+        if repl.session_log.is_none() && crate::oneshot::recording_enabled(&repl.config) {
+            repl.session_log = SessionLog::open(
+                &repl.session.provider_id,
+                repl.session.model.as_deref(),
+                repl.session.model_label.as_deref(),
+                repl.session.effort.as_deref(),
+            );
+        }
         Ok(repl)
     }
 
