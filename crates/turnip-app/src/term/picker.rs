@@ -6,7 +6,7 @@ use std::io;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::{StyledLine, LineStyle, Terminal};
+use super::{LineStyle, StyledLine, Terminal};
 
 /// One selectable row.
 pub struct PickerItem {
@@ -50,24 +50,46 @@ pub fn pick(
             cursor = visible.len().saturating_sub(1);
         }
         let (width, height) = terminal.size();
-        let rows = height.saturating_sub(4).max(3);
+        // Leave at least one item row on small screens when possible.
+        let show_title = height >= 4;
+        let show_count = height >= 3;
+        let rows = height.saturating_sub(1 + usize::from(show_title) + usize::from(show_count));
 
         let mut lines = Vec::new();
+        if show_title {
+            lines.push(StyledLine::styled(
+                turnip_core::text::truncate_columns(
+                    &format!("{title} (Enter: select, Esc: cancel)"),
+                    width,
+                ),
+                LineStyle {
+                    bold: true,
+                    ..Default::default()
+                },
+            ));
+        }
+        let filter_row = lines.len();
+        // Show the end of a long filter and keep its cursor on screen.
+        let mut filter_tail = String::new();
+        let mut columns = 0;
+        for ch in filter.chars().rev() {
+            let cells = turnip_core::text::char_width(ch).unwrap_or(0);
+            if columns + cells > width.saturating_sub(2) {
+                break;
+            }
+            filter_tail.insert(0, ch);
+            columns += cells;
+        }
         lines.push(StyledLine::styled(
-            format!("{title} (type to filter, Enter to select, Esc to cancel)"),
-            LineStyle {
-                bold: true,
-                ..Default::default()
-            },
-        ));
-        lines.push(StyledLine::styled(
-            format!("/{}", filter),
+            turnip_core::text::truncate_columns(&format!("/{filter_tail}"), width),
             LineStyle {
                 accent: true,
                 ..Default::default()
             },
         ));
-        let start = cursor.saturating_sub(rows / 2);
+        let start = cursor
+            .saturating_sub(rows / 2)
+            .min(visible.len().saturating_sub(rows));
         for (index, item) in visible.iter().enumerate().skip(start).take(rows) {
             let marker = if index == cursor { "› " } else { "  " };
             let mut text = format!("{marker}{}", item.label);
@@ -79,37 +101,56 @@ pub fn pick(
                 dim: index != cursor,
                 ..Default::default()
             };
-            lines.push(StyledLine::styled(turnip_core::text::truncate_columns(&text, width), style));
+            let text = turnip_core::text::sanitize_str(&text).replace('\n', " ");
+            lines.push(StyledLine::styled(
+                turnip_core::text::truncate_columns(&text, width),
+                style,
+            ));
         }
-        if visible.is_empty() {
-            lines.push(StyledLine::styled("  no matches", LineStyle { dim: true, ..Default::default() }));
+        if visible.is_empty() && rows > 0 {
+            lines.push(StyledLine::styled(
+                turnip_core::text::truncate_columns("  no matches", width),
+                LineStyle {
+                    dim: true,
+                    ..Default::default()
+                },
+            ));
         }
         let count_note = if visible.len() == items.len() {
             format!("{} items", items.len())
         } else {
             format!("{}/{}", visible.len(), items.len())
         };
-        lines.push(StyledLine::styled(count_note, LineStyle { dim: true, ..Default::default() }));
+        if show_count {
+            lines.push(StyledLine::styled(
+                turnip_core::text::truncate_columns(&count_note, width),
+                LineStyle {
+                    dim: true,
+                    ..Default::default()
+                },
+            ));
+        }
         terminal.render_region(&lines)?;
-        let filter_width = turnip_core::text::str_width(&filter);
-        terminal.cursor_in_region(1, 1 + filter_width as u16)?;
+        terminal.cursor_in_region(filter_row as u16, (1 + columns) as u16)?;
 
         // Input loop.
         let event = loop {
             match terminal.wait_event(std::time::Duration::from_millis(200))? {
                 Some(crate::term::TermEvent::Key(key)) => break Some(key),
-                Some(crate::term::TermEvent::Paste(_)) | Some(crate::term::TermEvent::Resize) => {
-                    continue;
+                Some(crate::term::TermEvent::Paste(text)) => {
+                    filter.push_str(&turnip_core::text::sanitize_str(&text).replace('\n', " "));
+                    cursor = 0;
+                    break None;
                 }
-                None => break None,
+                Some(crate::term::TermEvent::Resize) => break None,
+                None => continue,
             }
         };
         match event {
             None => continue,
             Some(key) => match key.code {
-                KeyCode::Esc | KeyCode::Char('c')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(None);
                 }
                 KeyCode::Enter => {
@@ -134,7 +175,11 @@ pub fn pick(
                 KeyCode::Backspace => {
                     filter.pop();
                 }
-                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     filter.push(ch);
                 }
                 _ => {}

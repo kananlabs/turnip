@@ -8,6 +8,7 @@
 
 pub mod markdown;
 pub mod picker;
+mod region;
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -56,38 +57,30 @@ impl StyledLine {
         }
     }
 
-    /// The line rendered with SGR escapes, wrapped to `width` columns.
-    pub fn render(&self, width: usize) -> String {
+    /// Apply SGR styling to an already laid-out screen row.
+    fn render(&self) -> String {
         let mut out = String::new();
-        let wrapped = turnip_core::text::wrap_line(&self.text, width.max(4));
-        let mut first = true;
-        for line in wrapped {
-            if !first {
-                out.push_str("\r\n");
-            }
-            first = false;
-            if self.style.dim {
-                out.push_str(&style::Attribute::Dim.to_string());
-            }
-            if self.style.bold {
-                out.push_str(&style::Attribute::Bold.to_string());
-            }
-            if self.style.accent {
-                out.push_str(&style::SetForegroundColor(style::Color::DarkCyan).to_string());
-            } else if self.style.error {
-                out.push_str(&style::SetForegroundColor(style::Color::Red).to_string());
-            } else if self.style.warning {
-                out.push_str(&style::SetForegroundColor(style::Color::Yellow).to_string());
-            } else if self.style.code {
-                out.push_str(&style::SetForegroundColor(style::Color::Grey).to_string());
-            }
-            out.push_str(&line);
-            if self.style.dim || self.style.bold {
-                out.push_str(&style::Attribute::Reset.to_string());
-            }
-            if self.style.accent || self.style.error || self.style.warning || self.style.code {
-                out.push_str(&style::SetForegroundColor(style::Color::Reset).to_string());
-            }
+        if self.style.dim {
+            out.push_str(&style::Attribute::Dim.to_string());
+        }
+        if self.style.bold {
+            out.push_str(&style::Attribute::Bold.to_string());
+        }
+        if self.style.accent {
+            out.push_str(&style::SetForegroundColor(style::Color::DarkCyan).to_string());
+        } else if self.style.error {
+            out.push_str(&style::SetForegroundColor(style::Color::Red).to_string());
+        } else if self.style.warning {
+            out.push_str(&style::SetForegroundColor(style::Color::Yellow).to_string());
+        } else if self.style.code {
+            out.push_str(&style::SetForegroundColor(style::Color::Grey).to_string());
+        }
+        out.push_str(&self.text);
+        if self.style.dim || self.style.bold {
+            out.push_str(&style::Attribute::Reset.to_string());
+        }
+        if self.style.accent || self.style.error || self.style.warning || self.style.code {
+            out.push_str(&style::SetForegroundColor(style::Color::Reset).to_string());
         }
         out
     }
@@ -96,127 +89,57 @@ impl StyledLine {
 /// A raw-mode terminal that owns the live region at the bottom of the
 /// scrollback.
 pub struct Terminal {
-    enabled: bool,
-    /// Lines currently occupied by the live region (for redraw/erase).
-    region_lines: usize,
-    /// Row (from the region top) where the cursor currently sits, so the
-    /// write invariant can be restored before the next region operation.
-    cursor_row: u16,
-    /// Events read but not yet consumed (e.g. pastes waiting behind keys).
-    pending: std::collections::VecDeque<TermEvent>,
+    region: region::Region,
 }
 
 impl Terminal {
     pub fn new() -> io::Result<Terminal> {
         terminal::enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            terminal::Clear(terminal::ClearType::Purge),
-            EnableBracketedPaste
-        );
-        Ok(Terminal {
-            enabled: true,
-            region_lines: 0,
-            cursor_row: 0,
-            pending: std::collections::VecDeque::new(),
-        })
+        // Construct the guard before setup so errors still restore raw mode.
+        let terminal = Terminal {
+            region: region::Region::default(),
+        };
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        Ok(terminal)
     }
 
     pub fn size(&self) -> (usize, usize) {
         terminal::size()
-            .map(|(columns, rows)| (columns as usize, rows as usize))
+            .map(|(columns, rows)| (columns.max(1) as usize, rows.max(1) as usize))
             .unwrap_or((80, 24))
     }
 
-    /// Write finished lines into the scrollback, above the live region.
-    /// `lines` must contain no newlines. Returns the number written.
-    ///
-    /// The invariant everywhere is: **the cursor sits at the live region's
-    /// top whenever the terminal is asked to write**. The caller may move it
-    /// into the region with [`Terminal::cursor_in_region`]; this first walks
-    /// back up, then writes the lines from the region top, so the region
-    /// shifts down intact and the pushed lines land just above it.
+    /// Commit finished content. The caller repaints the live region next.
     pub fn push_lines(&mut self, lines: &[StyledLine]) -> io::Result<usize> {
-        if lines.is_empty() {
-            return Ok(0);
-        }
-        self.restore_to_top()?;
-        let (width, _) = self.size();
-        let mut stdout = io::stdout();
-        for line in lines {
-            stdout.write_all(line.render(width).as_bytes())?;
-            stdout.write_all(b"\r\n")?;
-        }
-        stdout.flush()?;
+        self.region
+            .push(&mut io::stdout().lock(), lines, self.size().0)?;
         Ok(lines.len())
     }
 
-    /// Replace the live region with `lines` (no embedded newlines; wrapping
-    /// is applied per line). Leaves the cursor at the region's top, keeping
-    /// the write invariant for the next call.
+    /// Replace the live region, bounded by physical screen rows.
     pub fn render_region(&mut self, lines: &[StyledLine]) -> io::Result<()> {
-        self.restore_to_top()?;
-        let old_lines = self.region_lines;
-        let mut stdout = io::stdout();
-        // Erase the previous region, walking its rows from the top.
-        for index in 0..old_lines {
-            if index > 0 {
-                stdout.write_all(b"\r\n")?;
-            }
-            execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-        }
-        // Walk back to the region top.
-        if old_lines > 1 {
-            execute!(stdout, cursor::MoveUp(old_lines as u16 - 1))?;
-        }
-
-        let (width, _) = self.size();
-        for (index, line) in lines.iter().enumerate() {
-            if index > 0 {
-                stdout.write_all(b"\r\n")?;
-            }
-            execute!(stdout, cursor::MoveToColumn(0))?;
-            stdout.write_all(line.render(width).as_bytes())?;
-        }
-
-        // Erase rows of the previous region the new one does not cover.
-        let leftover = old_lines.saturating_sub(lines.len());
-        for _ in 0..leftover {
-            stdout.write_all(b"\r\n")?;
-            execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-        }
-        if leftover > 0 {
-            execute!(stdout, cursor::MoveUp(leftover as u16))?;
-        }
-
-        self.region_lines = lines.len().max(1);
-        self.cursor_row = 0;
-        stdout.flush()?;
-        // Park the cursor at the region top so the next write starts there.
-        if self.region_lines > 1 {
-            execute!(io::stdout(), cursor::MoveUp(self.region_lines as u16 - 1))?;
-        }
-        Ok(())
+        self.region
+            .render(&mut io::stdout().lock(), lines, self.size())
     }
 
-    /// Place the cursor at (row, column) within the current region, where
-    /// row 0 is the region's top line. The terminal remembers the row so
-    /// the next region write can restore the invariant.
-    pub fn cursor_in_region(&mut self, row_from_top: u16, column: u16) -> io::Result<()> {
-        let mut stdout = io::stdout();
-        execute!(stdout, cursor::MoveDown(row_from_top), cursor::MoveToColumn(column))?;
-        self.cursor_row = row_from_top;
-        stdout.flush()
+    /// Place the cursor relative to the region's top, not its last position.
+    pub fn cursor_in_region(&mut self, row: u16, column: u16) -> io::Result<()> {
+        self.region.cursor(
+            &mut io::stdout().lock(),
+            row as usize,
+            column as usize,
+            self.size().0,
+        )
     }
 
-    /// Walk the cursor back to the live region's top.
-    fn restore_to_top(&mut self) -> io::Result<()> {
-        if self.cursor_row > 0 {
-            execute!(io::stdout(), cursor::MoveUp(self.cursor_row))?;
-            self.cursor_row = 0;
-        }
-        Ok(())
+    pub fn clear(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        self.region.clear(&mut stdout)?;
+        execute!(
+            stdout,
+            terminal::Clear(terminal::ClearType::All),
+            cursor::MoveTo(0, 0)
+        )
     }
 
     pub fn hide_cursor(&mut self) -> io::Result<()> {
@@ -240,16 +163,11 @@ impl Terminal {
                 _ => {}
             }
         }
-        events.extend(self.pending.drain(..));
         Ok(events)
     }
 
-    /// Wait for the next terminal event, draining any already-pending ones
-    /// first (so pastes read behind keys are not lost).
+    /// Wait for one terminal event without draining or losing later events.
     pub fn wait_event(&mut self, timeout: Duration) -> io::Result<Option<TermEvent>> {
-        if let Some(event) = self.pending.pop_front() {
-            return Ok(Some(event));
-        }
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -272,23 +190,15 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if self.enabled {
-            let _ = self.restore_to_top();
-            if self.region_lines > 1 {
-                let _ = execute!(
-                    io::stdout(),
-                    cursor::MoveDown(self.region_lines as u16 - 1)
-                );
-            }
-            let _ = io::stdout().write_all(b"\r\n");
-            let _ = execute!(
-                io::stdout(),
-                cursor::Show,
-                style::ResetColor,
-                DisableBracketedPaste,
-            );
-            let _ = terminal::disable_raw_mode();
-        }
+        let _ = self.region.finish(&mut io::stdout().lock());
+        let _ = execute!(
+            io::stdout(),
+            cursor::Show,
+            style::SetAttribute(style::Attribute::Reset),
+            style::ResetColor,
+            DisableBracketedPaste,
+        );
+        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -310,7 +220,8 @@ pub fn is_interrupt(key: &KeyEvent) -> bool {
 
 /// Is this a paste or a regular character?
 fn is_printable(key: &KeyEvent) -> bool {
-    !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 /// Single-line-oriented input editor with history, kill ring basics, and
@@ -400,11 +311,15 @@ impl LineEditor {
             KeyCode::End | KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor = self.text.len();
             }
-            KeyCode::Up if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Up
+                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.history_older();
                 terminal.beep();
             }
-            KeyCode::Down if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Down
+                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.history_newer();
             }
             _ => {}
@@ -419,12 +334,55 @@ impl LineEditor {
         self.staged = None;
     }
 
-    /// Insert pasted text verbatim (newlines included).
+    /// Insert pasted text, retaining newlines but not terminal controls.
     pub fn insert_str(&mut self, text: &str) {
-        self.text.insert_str(self.cursor, text);
+        let text = turnip_core::text::sanitize_str(text);
+        self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
         self.history_index = None;
         self.staged = None;
+    }
+
+    /// Lay out input and its cursor together, then keep the cursor in view.
+    /// Unlike word wrapping, this preserves whitespace and exact positions.
+    pub fn view(&self, width: usize, max_rows: usize) -> (Vec<StyledLine>, (usize, usize)) {
+        let width = width.max(1);
+        let mut lines = Vec::new();
+        let mut position = (0, 0);
+        let mut offset = 0;
+        for (index, raw) in self.text.split('\n').enumerate() {
+            let prefix = if index == 0 { PROMPT } else { "  " };
+            let wrapped = region::wrap_line(&format!("{prefix}{raw}"), width);
+            if (offset..=offset + raw.len()).contains(&self.cursor) {
+                let before = format!("{prefix}{}", &raw[..self.cursor - offset]);
+                let before = region::wrap_line(&before, width);
+                let mut row = lines.len() + before.len() - 1;
+                let mut column = turnip_core::text::str_width(before.last().unwrap());
+                let next_width = raw[self.cursor - offset..]
+                    .chars()
+                    .next()
+                    .and_then(turnip_core::text::char_width)
+                    .unwrap_or(0)
+                    .min(width);
+                if column == width || column + next_width > width {
+                    row += 1;
+                    column = 0;
+                }
+                position = (row, column);
+            }
+            lines.extend(wrapped.into_iter().map(StyledLine::plain));
+            offset += raw.len() + 1;
+        }
+        while lines.len() <= position.0 {
+            lines.push(StyledLine::plain(""));
+        }
+        let start = position.0.saturating_sub(max_rows.max(1) - 1);
+        let visible = lines
+            .into_iter()
+            .skip(start)
+            .take(max_rows.max(1))
+            .collect();
+        (visible, (position.0 - start, position.1))
     }
 
     pub fn clear(&mut self) {
@@ -497,8 +455,6 @@ impl LineEditor {
         }
         self.cursor = self.text.len();
     }
-
-
 }
 
 fn prev_char_boundary(text: &str, cursor: usize) -> usize {
@@ -517,3 +473,77 @@ fn next_char_boundary(text: &str, cursor: usize) -> usize {
     boundary.min(text.len())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor(text: &str, cursor: usize) -> LineEditor {
+        let mut editor = LineEditor::new(Vec::new());
+        editor.insert_str(text);
+        editor.cursor = cursor;
+        editor
+    }
+
+    fn text(lines: &[StyledLine]) -> Vec<&str> {
+        lines.iter().map(|line| line.text.as_str()).collect()
+    }
+
+    #[test]
+    fn input_preserves_spaces_and_tracks_wrapped_cursor() {
+        let editor = editor("ab  cdefgh", 8);
+        let (lines, cursor) = editor.view(6, 10);
+        assert_eq!(text(&lines), ["› ab  ", "cdefgh"]);
+        assert_eq!(cursor, (1, 4));
+    }
+
+    #[test]
+    fn exact_width_input_has_a_visible_cursor_on_the_next_row() {
+        let editor = editor("abcd", 4);
+        let (lines, cursor) = editor.view(6, 10);
+        assert_eq!(text(&lines), ["› abcd", ""]);
+        assert_eq!(cursor, (1, 0));
+    }
+
+    #[test]
+    fn input_cursor_accounts_for_newlines_and_wide_characters() {
+        let editor = editor("界x\n世界", "界x\n世".len());
+        let (lines, cursor) = editor.view(6, 10);
+        assert_eq!(text(&lines), ["› 界x", "  世界"]);
+        assert_eq!(cursor, (1, 4));
+
+        let editor = self::editor("abc界", 3);
+        let (lines, cursor) = editor.view(6, 10);
+        assert_eq!(text(&lines), ["› abc", "界"]);
+        assert_eq!(cursor, (1, 0));
+    }
+
+    #[test]
+    fn long_input_is_scrolled_to_the_cursor_not_always_the_end() {
+        let mut editor = editor("one\ntwo\nthree\nfour", 3);
+        let (lines, cursor) = editor.view(12, 2);
+        assert_eq!(text(&lines), ["› one", "  two"]);
+        assert_eq!(cursor, (0, 5));
+
+        editor.cursor = editor.text.len();
+        let (lines, cursor) = editor.view(12, 2);
+        assert_eq!(text(&lines), ["  three", "  four"]);
+        assert_eq!(cursor, (1, 6));
+    }
+
+    #[test]
+    fn paste_strips_terminal_controls_and_expands_tabs() {
+        let mut editor = LineEditor::new(Vec::new());
+        editor.insert_str("a\x1b[2Jb\r\nc\td");
+        assert_eq!(editor.text, "ab\nc    d");
+        assert_eq!(editor.cursor, editor.text.len());
+    }
+
+    #[test]
+    fn input_fits_even_a_one_cell_terminal() {
+        let editor = editor("界", "界".len());
+        let (lines, cursor) = editor.view(1, 1);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(cursor, (0, 0));
+        assert!(turnip_core::text::str_width(&lines[0].text) <= 1);
+    }
+}

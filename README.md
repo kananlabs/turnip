@@ -143,8 +143,9 @@ the `turnip-core` crate docs (`lib.rs`).
 ## Development
 
 ```sh
-cargo test                     # 60 unit tests across both crates
-cargo build -p turnip-app      # binary at target/debug/turnip
+cargo test                     # unit tests across both crates + terminal emulator tests
+cargo build -p turnip-app       # binary at target/debug/turnip
+python3 scripts/test_tui.py     # real-PTY regression tests (Linux)
 python3 scripts/mock_openai_server.py 8765   # mock provider for manual smoke tests
 ```
 
@@ -153,6 +154,11 @@ translation for both dialects), turn assembly and abort repair, compaction
 seam classification, session round-trips with undo, the SSE parser, tool
 edge cases (edit uniqueness, bash timeout/interrupt, read slicing, image
 sniffing), config tiering and parsers, and the streaming markdown renderer.
+The TUI tests cover wrapped-row accounting, scrollback stability, bounded input
+and cursor placement, and growing/shrinking live regions. The PTY suite uses
+only Python's standard library and a local mock provider to exercise startup
+pickers, editing, paste, resize, clearing, and streaming tool turns; it also
+checks that idle screens produce no output and exit restores terminal mode.
 
 ## License
 

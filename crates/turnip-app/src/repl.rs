@@ -2,7 +2,6 @@
 //! with a live region over native scrollback, pickers, and session
 //! management.
 
-use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -14,7 +13,7 @@ use turnip_core::tools::{ToolEnv, ToolRegistry};
 use turnip_core::{Config, AgentSession};
 
 use crate::bootstrap::App;
-use crate::term::{markdown, picker, LineEditor, LineStyle, StyledLine, Terminal, PROMPT};
+use crate::term::{markdown, picker, LineEditor, LineStyle, StyledLine, Terminal};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -180,8 +179,8 @@ impl Repl {
     }
 
     fn main_loop(&mut self) -> i32 {
+        self.render_idle();
         while !self.quit {
-            self.render_idle();
             match self.terminal.wait_event(crate::term::POLL_INTERVAL) {
                 Ok(Some(crate::term::TermEvent::Key(key))) => {
                     if self.editor.handle_key(&key, &mut self.terminal).unwrap_or(false) {
@@ -192,26 +191,19 @@ impl Repl {
                         if !self.submit(line) {
                             return 0;
                         }
-                        continue;
                     }
-                    self.render_idle();
                 }
-                Ok(Some(crate::term::TermEvent::Paste(text))) => {
-                    self.editor.insert_str(&text);
-                    self.render_idle();
-                }
-                Ok(Some(crate::term::TermEvent::Resize)) => {
-                    self.render_idle();
-                }
-                // A poll timeout redraws nothing: the region only changes on
-                // events, so idle redraws would just burn CPU.
-                Ok(None) => {}
+                Ok(Some(crate::term::TermEvent::Paste(text))) => self.editor.insert_str(&text),
+                Ok(Some(crate::term::TermEvent::Resize)) => {}
+                // Nothing changed; do not repaint on poll timeouts.
+                Ok(None) => continue,
                 Err(_) => return 1,
             }
-            if let Some(prompt) = self.queued_prompt.take() {
+            while let Some(prompt) = self.queued_prompt.take() {
                 // A prompt was typed during the previous turn.
                 self.submit_prompt(prompt);
             }
+            self.render_idle();
         }
         0
     }
@@ -321,59 +313,13 @@ impl Repl {
 
     /// Render the idle input region: prompt line(s) plus footer.
     fn render_idle(&mut self) {
-        let width = self.terminal.size().0;
-        let mut lines = self.input_lines(width);
-        lines.push(self.footer_line(width));
-        let (row, column) = self.input_cursor_position(width);
+        let (width, height) = self.terminal.size();
+        let (mut lines, (row, column)) = self.editor.view(width, height.saturating_sub(1));
+        if height > 1 {
+            lines.push(self.footer_line(width));
+        }
         let _ = self.terminal.render_region(&lines);
         let _ = self.terminal.cursor_in_region(row as u16, column as u16);
-    }
-
-    fn input_lines(&self, width: usize) -> Vec<StyledLine> {
-        let prompt_width = PROMPT.chars().count();
-        let mut lines = Vec::new();
-        for (index, raw) in self.editor.text.split('\n').enumerate() {
-            let prefix = if index == 0 { PROMPT } else { "  " };
-            let text = format!("{prefix}{raw}");
-            let wrapped = turnip_core::text::wrap_line(&text, width.max(prompt_width + 4));
-            for (line_index, line) in wrapped.iter().enumerate() {
-                let style = if line_index == 0 && index == 0 {
-                    LineStyle::default()
-                } else {
-                    LineStyle { dim: false, ..Default::default() }
-                };
-                lines.push(StyledLine::styled(line.clone(), style));
-            }
-        }
-        if lines.is_empty() {
-            lines.push(StyledLine::plain(PROMPT));
-        }
-        lines
-    }
-
-    /// Display-column offset of the cursor within the input line.
-    /// The input cursor's (row, column) within the rendered input area,
-    /// where row 0 is the first input line. Earlier logical lines contribute
-    /// their wrapped rows so multi-line input and long wrapped lines stay
-    /// navigable.
-    fn input_cursor_position(&self, width: usize) -> (usize, usize) {
-        let prompt_width = PROMPT.chars().count();
-        let width = width.max(prompt_width + 4);
-        let before_cursor = &self.editor.text[..self.editor.cursor];
-        let cursor_line = before_cursor.matches('\n').count();
-        let current = before_cursor.rsplit('\n').next().unwrap_or("");
-
-        let mut row = 0usize;
-        for (index, line) in self.editor.text.split('\n').enumerate() {
-            if index >= cursor_line {
-                break;
-            }
-            let prefix = if index == 0 { prompt_width } else { 2 };
-            row += rows_for(prefix, line, width);
-        }
-        let prefix = if cursor_line == 0 { prompt_width } else { 2 };
-        let column = prefix + turnip_core::text::str_width(current);
-        (row, column.min(width.saturating_sub(1)))
     }
 
     fn footer_line(&self, width: usize) -> StyledLine {
@@ -404,7 +350,16 @@ impl Repl {
             text.push_str(&" ".repeat(room));
             text.push_str(hint);
         }
-        StyledLine::styled(text, LineStyle { dim: true, ..Default::default() })
+        StyledLine::styled(
+            turnip_core::text::truncate_columns(
+                &turnip_core::text::sanitize_str(&text).replace('\n', " "),
+                width,
+            ),
+            LineStyle {
+                dim: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// Interactive model resolution.
@@ -477,11 +432,7 @@ impl Repl {
             "effort" => self.cmd_effort(rest),
             "new" => self.cmd_new(),
             "clear" => {
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                    crossterm::cursor::MoveTo(0, 0)
-                );
+                let _ = self.terminal.clear();
                 self.state.last_render = None;
             }
             "compact" => self.cmd_compact(rest),
@@ -1076,7 +1027,7 @@ impl<'a> TurnRenderer<'a> {
         // Status line.
         lines.push(self.status_line());
         // Input line(s).
-        lines.push(StyledLine::plain(PROMPT.to_string() + self.editor.text.as_str()));
+        lines.extend(self.editor.view(width, height.saturating_sub(2)).0);
         if let Some(prompt) = &self.queued_prompt {
             lines.push(StyledLine::styled(
                 format!("queued: {prompt}"),
@@ -1084,13 +1035,7 @@ impl<'a> TurnRenderer<'a> {
             ));
         }
 
-        // Keep the region inside the screen; the newest content wins.
-        let max = height.saturating_sub(2).max(4);
-        if lines.len() > max {
-            let overflow = lines.len() - max;
-            lines.drain(..overflow);
-            lines.insert(0, StyledLine::styled("…", LineStyle { dim: true, ..Default::default() }));
-        }
+        // The terminal clips overflow after wrapping, in physical rows.
         let _ = self.terminal.render_region(&lines);
     }
 
@@ -1335,11 +1280,6 @@ fn tool_argument_display(name: &str, arguments: &str) -> String {
     }
 }
 
-/// Display rows a rendered logical line occupies at the given width.
-fn rows_for(prefix: usize, line: &str, width: usize) -> usize {
-    turnip_core::text::wrap_line(&format!("{}{}", " ".repeat(prefix), line), width).len().max(1)
-}
-
 /// Compact "in 1.2k · out 340" style token totals.
 fn format_tokens(usage: &StreamUsage) -> String {
     let mut parts = Vec::new();
@@ -1409,52 +1349,38 @@ fn expand_mentions(prompt: &str, cwd: &Path) -> String {
 
 /// The startup banner.
 fn print_banner(terminal: &mut Terminal, app: &App) {
-    let art = [
-        r"      _          _ _ ",
-        r"     / \   _ __ (_| |",
-        r"    / _ \ | '_ \| | |",
-        r"   / ___ \| | | | | |",
-        r"  /_/   \_\_| |_|_|_|",
-    ];
-    for line in art {
-        let _ = terminal.push_lines(&[StyledLine::styled(
-            line,
-            LineStyle {
-                accent: true,
-                ..Default::default()
-            },
-        )]);
-    }
     let provider = app
         .provider_descriptor
         .as_ref()
         .map(|d| d.display_name.clone())
         .unwrap_or_else(|| "no provider".into());
     let model = app.config.str("model").unwrap_or_default();
+    let dim = LineStyle {
+        dim: true,
+        ..Default::default()
+    };
     let mut lines = vec![
-        format!("turnip {} · provider: {provider} · model: {model}", turnip_core::version()),
-        format!("config: {}", app.config.file_path().display()),
-    ];
-    if let Some(meta) = &app.meta {
-        lines.push(format!(
-            "resumed session {} (cwd: {})",
-            meta.id,
-            app.cwd.display()
-        ));
-    } else {
-        lines.push(format!("cwd: {}", app.cwd.display()));
-    }
-    lines.push("type a prompt, /help for commands, Ctrl+C to interrupt".into());
-    for line in lines {
-        let _ = terminal.push_lines(&[StyledLine::styled(
-            line,
+        StyledLine::styled(
+            format!("turnip {} · {provider} · {model}", turnip_core::version()),
             LineStyle {
-                dim: true,
+                bold: true,
+                accent: true,
                 ..Default::default()
             },
-        )]);
+        ),
+        StyledLine::styled(format!("cwd: {}", app.cwd.display()), dim),
+    ];
+    if let Some(meta) = &app.meta {
+        lines.push(StyledLine::styled(
+            format!("resumed session {}", meta.id),
+            dim,
+        ));
     }
-    let _ = std::io::stdout().flush();
+    lines.push(StyledLine::styled(
+        "/help for commands · Ctrl+C to interrupt",
+        dim,
+    ));
+    let _ = terminal.push_lines(&lines);
 }
 
 #[cfg(test)]
