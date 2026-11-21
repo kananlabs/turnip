@@ -584,7 +584,16 @@ impl Repl {
                 .flatten()
                 .and_then(|id| descriptors.into_iter().find(|d| d.id == id))
         } else {
-            descriptors.into_iter().find(|d| d.id == rest)
+            match descriptors.into_iter().find(|d| d.id == rest) {
+                Some(descriptor) => Some(descriptor),
+                None => {
+                    self.push_line(StyledLine::styled(
+                        format!("unknown provider '{rest}' — try /provider"),
+                        LineStyle { error: true, ..Default::default() },
+                    ));
+                    return;
+                }
+            }
         };
         let Some(descriptor) = descriptor else {
             return;
