@@ -241,8 +241,11 @@ pub struct LineEditor {
     pub cursor: usize,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
-    /// Ctrl+C on an empty line requested a quit.
+    /// Ctrl+C twice on an empty line requested a quit.
     pub quit_requested: bool,
+    /// First Ctrl+C on an empty line armed the exit (hax parity: show a
+    /// ghost hint, quit only on the second press).
+    exit_armed: bool,
     /// Staged text while browsing history.
     staged: Option<String>,
 }
@@ -255,12 +258,19 @@ impl LineEditor {
             history,
             history_index: None,
             quit_requested: false,
+            exit_armed: false,
             staged: None,
         }
     }
 
     /// Feed one key event; returns true when the user submitted the line.
     pub fn handle_key(&mut self, key: &KeyEvent, terminal: &mut Terminal) -> io::Result<bool> {
+        let is_ctrl_c = key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if !is_ctrl_c {
+            // Any other key disarms a pending Ctrl+C exit.
+            self.exit_armed = false;
+        }
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.insert('\n');
@@ -271,11 +281,7 @@ impl LineEditor {
                 self.insert('\n');
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.text.is_empty() {
-                    self.quit_requested = true;
-                    return Ok(true);
-                }
-                self.clear();
+                return Ok(self.interrupt());
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.text.drain(..self.cursor);
@@ -350,12 +356,28 @@ impl LineEditor {
         self.cursor += text.len();
         self.history_index = None;
         self.staged = None;
+        self.exit_armed = false;
     }
 
     /// Lay out input and its cursor together, then keep the cursor in view.
     /// Unlike word wrapping, this preserves whitespace and exact positions.
     pub fn view(&self, width: usize, max_rows: usize) -> (Vec<StyledLine>, (usize, usize)) {
         let width = width.max(1);
+        // Armed exit on an empty line: show a dim ghost hint, like hax's
+        // "ctrl+c again to exit".
+        if self.exit_armed && self.text.is_empty() {
+            return (
+                vec![StyledLine::styled(
+                    format!("{PROMPT}ctrl+c again to exit"),
+                    LineStyle {
+                        dim: true,
+                        ..Default::default()
+                    },
+                )
+                .verbatim()],
+                (0, turnip_core::text::str_width(PROMPT)),
+            );
+        }
         let mut lines = Vec::new();
         let mut position = (0, 0);
         let mut offset = 0;
@@ -406,12 +428,34 @@ impl LineEditor {
         (visible, (position.0 - start, position.1))
     }
 
+    /// Ctrl+C: clear the buffer, keeping the discarded draft recallable via
+    /// Up (in memory only); on an empty line, arm the exit on the first
+    /// press and request a quit on the second, like hax.
+    pub fn interrupt(&mut self) -> bool {
+        if !self.text.is_empty() {
+            let draft = std::mem::take(&mut self.text);
+            self.cursor = 0;
+            self.history_index = None;
+            self.staged = None;
+            self.exit_armed = false;
+            self.history.push(draft);
+            return false;
+        }
+        if self.exit_armed {
+            self.quit_requested = true;
+            return true;
+        }
+        self.exit_armed = true;
+        false
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
         self.history_index = None;
         self.staged = None;
         self.quit_requested = false;
+        self.exit_armed = false;
     }
 
     /// Take the submitted text and reset the editor.
@@ -421,6 +465,7 @@ impl LineEditor {
         self.history_index = None;
         self.staged = None;
         self.quit_requested = false;
+        self.exit_armed = false;
         text
     }
 
@@ -566,5 +611,53 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(cursor, (0, 0));
         assert!(turnip_core::text::str_width(&lines[0].text) <= 1);
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_c_on_text_clears_and_keeps_the_draft_recallable() {
+        let mut editor = LineEditor::new(Vec::new());
+        editor.insert_str("draft text");
+        assert!(!editor.interrupt());
+        assert!(!editor.quit_requested);
+        assert!(!editor.exit_armed);
+        assert_eq!(editor.text, "");
+        // Up recalls the discarded draft, like hax's in-memory history.
+        editor.history_older();
+        assert_eq!(editor.text, "draft text");
+    }
+
+    #[test]
+    fn ctrl_c_twice_on_empty_quits_but_once_arms() {
+        let mut editor = LineEditor::new(Vec::new());
+        assert!(!editor.interrupt());
+        assert!(!editor.quit_requested);
+        assert!(editor.exit_armed);
+        // The armed state shows the ghost hint.
+        let (lines, cursor) = editor.view(40, 4);
+        assert_eq!(text(&lines), ["› ctrl+c again to exit"]);
+        assert_eq!(cursor, (0, 2));
+        // Second press quits.
+        assert!(editor.interrupt());
+        assert!(editor.quit_requested);
+    }
+
+    #[test]
+    fn other_keys_disarm_the_armed_exit() {
+        let mut editor = LineEditor::new(Vec::new());
+        editor.interrupt();
+        assert!(editor.exit_armed);
+        // Any other input path (typing, paste) disarms the pending exit.
+        editor.insert_str("x");
+        assert!(!editor.exit_armed);
+        assert!(!editor.quit_requested);
+        // And a submitted line resets the editor state entirely.
+        editor.interrupt();
+        editor.take();
+        assert!(!editor.exit_armed);
+        assert!(!editor.quit_requested);
     }
 }

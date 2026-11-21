@@ -512,7 +512,7 @@ impl Repl {
             ("/clear", "clear the screen"),
             ("/quit", "exit"),
             ("", "submit an empty line to continue an interrupted turn"),
-            ("Ctrl+C", "interrupt the running turn; clear the input"),
+            ("Ctrl+C", "interrupt the running turn; clear the input; twice on empty exits"),
         ];
         self.push_note("commands:");
         for (name, description) in help {
