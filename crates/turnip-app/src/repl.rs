@@ -1047,12 +1047,20 @@ impl<'a> TurnRenderer<'a> {
     /// result — the tail of what streamed live (process output, diff
     /// previews), or the head of the model-facing result when nothing
     /// streamed (file reads, errors).
+    ///
+    /// Results go in hax's tool box: gutter glyphs carry the rows — ┌
+    /// opens, │ runs, └ closes (a lone row closes; hax's › marker is
+    /// turnip's prompt glyph) — in plain dim, so the rows read as the
+    /// call's output and never as a second accent line. The call header
+    /// takes bold accent, which no result row shares, so the two never
+    /// blur even where the terminal draws faint only subtly.
     fn commit_tool_view(&mut self, tool: &ToolView, summary: &str) {
         let width = self.terminal_width();
         let mut lines = vec![StyledLine::styled(
             format!("▸ {}({})", tool.name, tool.argument),
             LineStyle {
                 accent: true,
+                bold: true,
                 ..Default::default()
             },
         )];
@@ -1063,13 +1071,27 @@ impl<'a> TurnRenderer<'a> {
             tail.reverse();
             tail
         };
-        for line in shown {
+        let dim = LineStyle {
+            dim: true,
+            ..Default::default()
+        };
+        let total = shown.len();
+        for (index, line) in shown.into_iter().enumerate() {
+            let gutter = if total == 1 {
+                "└"
+            } else if index == 0 {
+                "┌"
+            } else if index + 1 == total {
+                "└"
+            } else {
+                "│"
+            };
             lines.push(StyledLine::styled(
                 format!(
-                    "  {}",
+                    "{gutter} {}",
                     turnip_core::text::truncate_columns(line, width.saturating_sub(4))
                 ),
-                chrome_dim(),
+                dim,
             ));
         }
         self.commit_block(Channel::Tool, lines);
@@ -1119,24 +1141,32 @@ impl<'a> TurnRenderer<'a> {
                 ));
             }
         }
-        // Running tool view.
+        // Running tool view: the call header, then live output rows with
+        // hax's gutter — │ for settled rows, ╵ for the newest, still-open
+        // one. Committing swaps them into the closed ┌/│/└ box.
         if let Some(tool) = &self.state.tool {
             lines.push(StyledLine::styled(
                 format!("▸ {}({})", tool.name, tool.argument),
                 LineStyle {
                     accent: true,
+                    bold: true,
                     ..Default::default()
                 },
             ));
             let mut tail: Vec<&str> = tool.output.lines().rev().take(6).collect();
             tail.reverse();
-            for line in tail {
+            let total = tail.len();
+            for (index, line) in tail.into_iter().enumerate() {
+                let gutter = if index + 1 == total { "╵" } else { "│" };
                 lines.push(StyledLine::styled(
                     format!(
-                        "  {}",
+                        "{gutter} {}",
                         turnip_core::text::truncate_columns(line, width.saturating_sub(4))
                     ),
-                    chrome_dim(),
+                    LineStyle {
+                        dim: true,
+                        ..Default::default()
+                    },
                 ));
             }
         }
@@ -1350,20 +1380,6 @@ impl<'a> TurnHooks for TurnRenderer<'a> {
             note,
             LineStyle { dim: true, ..Default::default() },
         )]);
-    }
-}
-
-/// hax's `THEME_CHROME_DIM` in its default preset: the accent hue drawn
-/// faint (`ANSI_DIM ANSI_CYAN`). Used for tool results, where the faint
-/// attribute alone is easy to miss — some terminals draw SGR 2 only
-/// subtly, which leaves results looking like plain text. The hue keeps
-/// them distinct from assistant messages (default), code (grey), and the
-/// bright accent of the `▸` call line above them.
-fn chrome_dim() -> LineStyle {
-    LineStyle {
-        accent: true,
-        dim: true,
-        ..Default::default()
     }
 }
 
