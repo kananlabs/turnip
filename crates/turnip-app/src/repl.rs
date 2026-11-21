@@ -1069,10 +1069,7 @@ impl<'a> TurnRenderer<'a> {
                     "  {}",
                     turnip_core::text::truncate_columns(line, width.saturating_sub(4))
                 ),
-                LineStyle {
-                    dim: true,
-                    ..Default::default()
-                },
+                chrome_dim(),
             ));
         }
         self.commit_block(Channel::Tool, lines);
@@ -1139,10 +1136,7 @@ impl<'a> TurnRenderer<'a> {
                         "  {}",
                         turnip_core::text::truncate_columns(line, width.saturating_sub(4))
                     ),
-                    LineStyle {
-                        dim: true,
-                        ..Default::default()
-                    },
+                    chrome_dim(),
                 ));
             }
         }
@@ -1356,6 +1350,20 @@ impl<'a> TurnHooks for TurnRenderer<'a> {
             note,
             LineStyle { dim: true, ..Default::default() },
         )]);
+    }
+}
+
+/// hax's `THEME_CHROME_DIM` in its default preset: the accent hue drawn
+/// faint (`ANSI_DIM ANSI_CYAN`). Used for tool results, where the faint
+/// attribute alone is easy to miss — some terminals draw SGR 2 only
+/// subtly, which leaves results looking like plain text. The hue keeps
+/// them distinct from assistant messages (default), code (grey), and the
+/// bright accent of the `▸` call line above them.
+fn chrome_dim() -> LineStyle {
+    LineStyle {
+        accent: true,
+        dim: true,
+        ..Default::default()
     }
 }
 
