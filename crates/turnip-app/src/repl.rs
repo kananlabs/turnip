@@ -948,16 +948,34 @@ impl Repl {
                     None => self.push_note(&format!("{key} is unset")),
                 }
             }
-            (Some(key), Some(value)) => match self.config.persist(key, Some(value)) {
-                Ok(()) => {
-                    self.config.set_run(key, None);
-                    self.push_note(&format!("{key} = {value} (saved)"));
+            (Some(key), Some(value)) => {
+                if key == "provider" || key == "model" || key == "effort" {
+                    self.push_note(
+                        "provider/model/effort are saved per provider — use /provider, /model, /effort",
+                    );
+                    return;
                 }
-                Err(error) => self.push_line(StyledLine::styled(
-                    error.to_string(),
-                    LineStyle { error: true, ..Default::default() },
-                )),
-            },
+                match turnip_core::config::validate_setting(key, value) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.push_line(StyledLine::styled(
+                            error.to_string(),
+                            LineStyle { error: true, ..Default::default() },
+                        ));
+                        return;
+                    }
+                }
+                match self.config.persist(key, Some(value)) {
+                    Ok(()) => {
+                        self.config.set_run(key, None);
+                        self.push_note(&format!("{key} = {value} (saved)"));
+                    }
+                    Err(error) => self.push_line(StyledLine::styled(
+                        error.to_string(),
+                        LineStyle { error: true, ..Default::default() },
+                    )),
+                }
+            }
         }
     }
 }

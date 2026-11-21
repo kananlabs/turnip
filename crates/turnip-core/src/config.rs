@@ -331,6 +331,59 @@ pub fn setting_find(key: &str) -> Option<&'static Setting> {
     SETTINGS.iter().find(|s| s.key == key)
 }
 
+/// Validate a `/config <key> <value>` assignment. The key must be a known
+/// setting, or live in the free-form `providers.*` namespace; the value must
+/// parse for the setting's kind.
+pub fn validate_setting(key: &str, value: &str) -> Result<()> {
+    if key.starts_with("providers.") {
+        return Ok(());
+    }
+    let Some(setting) = setting_find(key) else {
+        return Err(CoreError::message(format!(
+            "unknown setting '{key}' — /config lists the valid keys"
+        )));
+    };
+    let invalid = || {
+        CoreError::message(format!(
+            "'{value}' is not a valid value for '{key}'"
+        ))
+    };
+    match setting.kind {
+        Kind::String => {}
+        Kind::Int => {
+            if value.trim().parse::<i64>().is_err() {
+                return Err(invalid());
+            }
+        }
+        Kind::Bool => {
+            if parse_bool(value).is_none() {
+                return Err(invalid());
+            }
+        }
+        Kind::Tristate => {
+            if value.trim() != "auto" && parse_tristate(value).is_none() {
+                return Err(invalid());
+            }
+        }
+        Kind::Size => {
+            if parse_size(value) == 0 {
+                return Err(invalid());
+            }
+        }
+        Kind::Tokens => {
+            if parse_token_count(value) <= 0 {
+                return Err(invalid());
+            }
+        }
+        Kind::Duration => {
+            if parse_duration_ms(value) < 0 {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse positive byte counts with case-insensitive binary k/m suffixes
 /// (k = 1024, m = 1024*1024); invalid input yields 0.
 pub fn parse_size(input: &str) -> u64 {
@@ -812,6 +865,24 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_validation() {
+        // Unknown keys are rejected; the providers namespace is free-form.
+        assert!(validate_setting("bogus_key", "foo").is_err());
+        assert!(validate_setting("providers.custom.base_url", "x").is_ok());
+        // Values must parse for the setting's kind.
+        assert!(validate_setting("compact.threshold", "85").is_ok());
+        assert!(validate_setting("compact.threshold", "banana").is_err());
+        assert!(validate_setting("markdown", "on").is_ok());
+        assert!(validate_setting("markdown", "maybe").is_err());
+        assert!(validate_setting("sort_models", "auto").is_ok());
+        assert!(validate_setting("tool_output_cap", "50k").is_ok());
+        assert!(validate_setting("tool_output_cap", "0").is_err());
+        assert!(validate_setting("bash.timeout", "2m").is_ok());
+        assert!(validate_setting("bash.timeout", "soon").is_err());
+        assert!(validate_setting("max_turns", "0").is_ok());
+    }
 
     #[test]
     fn duration_parsing() {
