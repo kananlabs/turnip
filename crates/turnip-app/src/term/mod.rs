@@ -30,6 +30,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(30);
 pub struct StyledLine {
     pub text: String,
     pub style: LineStyle,
+    hard_wrap: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -45,17 +46,21 @@ pub struct LineStyle {
 
 impl StyledLine {
     pub fn plain(text: impl Into<String>) -> StyledLine {
-        StyledLine {
-            text: text.into(),
-            style: LineStyle::default(),
-        }
+        Self::styled(text, LineStyle::default())
     }
 
     pub fn styled(text: impl Into<String>, style: LineStyle) -> StyledLine {
         StyledLine {
             text: text.into(),
             style,
+            hard_wrap: false,
         }
+    }
+
+    /// Preserve whitespace for code and rows already laid out by the editor.
+    fn verbatim(mut self) -> Self {
+        self.hard_wrap = true;
+        self
     }
 
     /// Apply SGR styling to an already laid-out screen row.
@@ -378,14 +383,14 @@ impl LineEditor {
             lines.extend(wrapped.into_iter().enumerate().map(|(row, text)| {
                 // The prompt row carries the input's identity: accent, like
                 // the echo a submitted turn leaves in the scrollback.
-                if first_row && row == 0 {
-                    StyledLine::styled(text, LineStyle {
-                        accent: true,
+                StyledLine::styled(
+                    text,
+                    LineStyle {
+                        accent: first_row && row == 0,
                         ..Default::default()
-                    })
-                } else {
-                    StyledLine::plain(text)
-                }
+                    },
+                )
+                .verbatim()
             }));
             offset += raw.len() + 1;
         }

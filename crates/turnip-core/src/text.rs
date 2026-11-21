@@ -117,43 +117,52 @@ pub fn str_width(text: &str) -> usize {
 /// Wrap a single logical line into display lines of at most `width` columns,
 /// breaking on spaces when possible.
 pub fn wrap_line(text: &str, width: usize) -> Vec<String> {
-    if width == 0 || text.is_empty() {
-        return vec![text.to_string()];
-    }
+    let width = width.max(1);
+    // As in the terminal's hard wrap, replace glyphs that cannot fit even
+    // on a row by themselves.
+    let narrow;
+    let mut rest = if width == 1 && text.chars().any(|ch| char_width(ch).unwrap_or(0) > 1) {
+        narrow = text
+            .chars()
+            .map(|ch| if char_width(ch).unwrap_or(0) > 1 { '�' } else { ch })
+            .collect::<String>();
+        narrow.as_str()
+    } else {
+        text
+    };
     let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut used = 0usize;
-    for word in text.split(' ') {
-        let word_width = str_width(word);
-        if used > 0 && used + 1 + word_width > width {
-            lines.push(std::mem::take(&mut current));
-            used = 0;
+    loop {
+        let mut columns = 0;
+        let mut end = rest.len();
+        let mut word_break = None;
+        let mut seen_word = false;
+        for (index, ch) in rest.char_indices() {
+            if ch == ' ' && seen_word {
+                word_break = Some(index);
+            }
+            columns += char_width(ch).unwrap_or(0);
+            if columns > width {
+                end = index;
+                break;
+            }
+            seen_word |= ch != ' ';
         }
-        if word_width > width {
-            // Hard-break an oversized word.
-            let mut piece = String::new();
-            let mut piece_width = 0;
-            for ch in word.chars() {
-                let cw = char_width(ch).unwrap_or(0);
-                if piece_width + cw > width {
-                    lines.push(std::mem::take(&mut piece));
-                    piece_width = 0;
-                }
-                piece.push(ch);
-                piece_width += cw;
+        if end == rest.len() {
+            lines.push(rest.to_string());
+            break;
+        }
+        if let Some(at) = word_break {
+            lines.push(rest[..at].trim_end_matches(' ').to_string());
+            rest = rest[at..].trim_start_matches(' ');
+            if rest.is_empty() {
+                break;
             }
-            current = piece;
-            used = piece_width;
         } else {
-            if used > 0 {
-                current.push(' ');
-                used += 1;
-            }
-            current.push_str(word);
-            used += word_width;
+            // No separator fits: hard-wrap the oversized word.
+            lines.push(rest[..end].to_string());
+            rest = &rest[end..];
         }
     }
-    lines.push(current);
     lines
 }
 
@@ -266,6 +275,14 @@ mod tests {
         let lines = wrap_line("alpha beta gamma delta", 11);
         assert!(lines.iter().all(|l| str_width(l) <= 11));
         assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
+    }
+
+    #[test]
+    fn wraps_by_display_width_with_a_hard_break_fallback() {
+        assert_eq!(wrap_line("a 界界", 5), ["a", "界界"]);
+        assert_eq!(wrap_line("abcdef next", 4), ["abcd", "ef", "next"]);
+        assert_eq!(wrap_line("界 a", 1), ["�", "a"]);
+        assert_eq!(wrap_line(" a  b ", 6), [" a  b "]);
     }
 
     #[test]

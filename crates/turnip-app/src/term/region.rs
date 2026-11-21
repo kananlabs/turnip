@@ -41,9 +41,16 @@ fn screen_lines(lines: &[StyledLine], width: usize) -> Vec<StyledLine> {
     for line in lines {
         let text = turnip_core::text::sanitize_str(&line.text);
         for logical in text.split('\n') {
-            for row in wrap_line(logical, width) {
-                rows.push(StyledLine::styled(row, line.style));
-            }
+            let wrapped = if line.hard_wrap {
+                wrap_line(logical, width)
+            } else {
+                turnip_core::text::wrap_line(logical, width)
+            };
+            rows.extend(
+                wrapped
+                    .into_iter()
+                    .map(|row| StyledLine::styled(row, line.style)),
+            );
         }
     }
     rows
@@ -291,6 +298,16 @@ mod tests {
             assert_eq!(screen.contents(), expected);
         }
         assert!(expected.starts_with("first\nsecond\nthird"));
+    }
+
+    #[test]
+    fn prose_wraps_at_word_boundaries_live_and_in_scrollback() {
+        let mut screen = Screen::new(9, 6);
+        screen.render(&[StyledLine::plain("alpha beta gamma")]);
+        assert_eq!(screen.contents(), "alpha\nbeta\ngamma");
+        screen.push("alpha beta gamma");
+        screen.render(&[StyledLine::plain("input")]);
+        assert_eq!(screen.contents(), "alpha\nbeta\ngamma\ninput");
     }
 
     #[test]

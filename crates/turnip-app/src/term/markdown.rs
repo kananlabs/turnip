@@ -2,7 +2,8 @@
 //! complete (and not inside an open code block) can be flushed into the
 //! scrollback, and only the tail re-renders in the live region.
 
-use super::{StyledLine, LineStyle};
+use super::{LineStyle, StyledLine};
+use turnip_core::text::{sanitize_str, str_width, wrap_line};
 
 /// Render `text` (markdown) into styled terminal lines, each wrapped to
 /// `width` display columns. Supports what streams actually contain: fenced
@@ -26,7 +27,8 @@ pub fn render(text: &str, width: usize) -> Vec<StyledLine> {
 
     // The newline that ends the last line is a line ending, not an empty
     // line of its own.
-    let body = text.strip_suffix('\n').unwrap_or(text);
+    let text = sanitize_str(text);
+    let body = text.strip_suffix('\n').unwrap_or(&text);
     for raw in body.split('\n') {
         let trimmed = raw.trim_start();
         let indent = raw.len() - trimmed.len();
@@ -61,73 +63,60 @@ pub fn render(text: &str, width: usize) -> Vec<StyledLine> {
             lines.push(StyledLine::plain(""));
             pending_break = false;
         }
-        // Headings.
-        if let Some(rest) = trimmed.strip_prefix("###") {
-            lines.push(StyledLine::styled(
-                format!("{indent}{}", rest.trim()),
-                LineStyle {
-                    bold: true,
-                    ..Default::default()
-                },
-            ));
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("##") {
-            lines.push(StyledLine::styled(
-                format!("{indent}{}", rest.trim()),
-                LineStyle {
-                    bold: true,
-                    accent: true,
-                    ..Default::default()
-                },
-            ));
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix('#') {
-            lines.push(StyledLine::styled(
-                format!("{indent}{}", rest.trim()),
-                LineStyle {
-                    bold: true,
-                    accent: true,
-                    ..Default::default()
-                },
-            ));
-            continue;
-        }
-        // Block quote.
-        if let Some(rest) = trimmed.strip_prefix('>') {
-            let rendered = render_inline(rest.trim(), width.saturating_sub(2));
-            lines.push(StyledLine::styled(
-                format!("{indent}│ {rendered}"),
-                LineStyle {
-                    dim: true,
-                    ..Default::default()
-                },
-            ));
-            continue;
-        }
-        // Bullet list (also handles "-").
-        if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
-            let rest = &trimmed[2..];
-            let rendered = render_inline(rest, width.saturating_sub(indent.len() + 2));
-            lines.push(StyledLine::plain(format!("{indent}• {rendered}")));
-            continue;
-        }
-        // Numbered list: "12. item" keeps its number aligned.
-        let number_len = trimmed
+        let mut style = LineStyle::default();
+        let mut marker = "";
+        let content = if let Some(rest) = trimmed.strip_prefix("###") {
+            style.bold = true;
+            rest.trim()
+        } else if let Some(rest) = trimmed
+            .strip_prefix("##")
+            .or_else(|| trimmed.strip_prefix('#'))
+        {
+            style.bold = true;
+            style.accent = true;
+            rest.trim()
+        } else if let Some(rest) = trimmed.strip_prefix('>') {
+            style.dim = true;
+            marker = "│ ";
+            rest.trim()
+        } else if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
+            marker = "• ";
+            &trimmed[2..]
+        } else if let Some(dot) = trimmed
             .find(". ")
             .filter(|dot| trimmed[..*dot].chars().all(|c| c.is_ascii_digit()))
-            .map(|dot| dot + 2)
-            .unwrap_or(0);
-        if number_len > 0 {
-            let marker: String = trimmed[..number_len].to_string();
-            let rest = &trimmed[number_len..];
-            let rendered = render_inline(rest, width.saturating_sub(indent.len() + number_len));
-            lines.push(StyledLine::plain(format!("{indent}{marker}{rendered}")));
+        {
+            let (number, rest) = trimmed.split_at(dot + 2);
+            marker = number;
+            rest
+        } else {
+            trimmed
+        };
+        let rendered = render_inline(content);
+        let prefix_width = indent.len() + str_width(marker);
+        if prefix_width >= width {
+            // No room for a hanging indent; wrap the whole line instead.
+            lines.extend(
+                wrap_line(&format!("{indent}{marker}{rendered}"), width)
+                    .into_iter()
+                    .map(|row| StyledLine::styled(row, style)),
+            );
             continue;
         }
-        let rendered = render_inline(trimmed, width.saturating_sub(indent.len()));
-        lines.push(StyledLine::plain(format!("{indent}{rendered}")));
+        let hanging = if marker == "│ " {
+            marker.to_string()
+        } else {
+            " ".repeat(str_width(marker))
+        };
+        lines.extend(
+            wrap_line(&rendered, width - prefix_width)
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let prefix = if index == 0 { marker } else { &hanging };
+                    StyledLine::styled(format!("{indent}{prefix}{row}"), style)
+                }),
+        );
     }
 
     if !code_lines.is_empty() || in_code {
@@ -155,7 +144,10 @@ fn push_code_block(lines: &mut Vec<StyledLine>, code: &[String], lang: &str, wid
         format!(" {lang}")
     };
     lines.push(StyledLine::styled(
-        format!("┌─{label}{}", "─".repeat(width.saturating_sub(label.len() + 4))),
+        format!(
+            "┌─{label}{}",
+            "─".repeat(width.saturating_sub(label.len() + 4))
+        ),
         LineStyle {
             dim: true,
             ..Default::default()
@@ -165,13 +157,16 @@ fn push_code_block(lines: &mut Vec<StyledLine>, code: &[String], lang: &str, wid
         // Code keeps its exact spacing: hard-wrap instead of reflowing on
         // spaces, which would eat the indentation.
         for wrapped in super::region::wrap_line(line, width.saturating_sub(4)) {
-            lines.push(StyledLine::styled(
-                format!("│ {wrapped}"),
-                LineStyle {
-                    code: true,
-                    ..Default::default()
-                },
-            ));
+            lines.push(
+                StyledLine::styled(
+                    format!("│ {wrapped}"),
+                    LineStyle {
+                        code: true,
+                        ..Default::default()
+                    },
+                )
+                .verbatim(),
+            );
         }
     }
     lines.push(StyledLine::styled(
@@ -184,7 +179,7 @@ fn push_code_block(lines: &mut Vec<StyledLine>, code: &[String], lang: &str, wid
 }
 
 /// Inline constructs: `code`, **bold**, *italic*, and [links](url).
-fn render_inline(text: &str, width: usize) -> String {
+fn render_inline(text: &str) -> String {
     let mut out = String::new();
     let chars: Vec<char> = text.chars().collect();
     let mut index = 0;
@@ -194,40 +189,33 @@ fn render_inline(text: &str, width: usize) -> String {
             '`' => {
                 if let Some(end) = chars[index + 1..].iter().position(|c| *c == '`') {
                     let code: String = chars[index + 1..index + 1 + end].iter().collect();
-                    if turnip_core::text::str_width(&code) + out.chars().count() + 2 <= width {
-                        out.push_str(&code);
-                        index += end + 2;
-                        continue;
-                    }
+                    out.push_str(&code);
+                    index += end + 2;
+                    continue;
                 }
                 out.push(ch);
             }
             '*' | '_' => {
                 // Bold (**/__), then emphasis (*/_).
-                let mut consumed = false;
                 if chars.get(index + 1) == Some(&ch) {
+                    let start = index;
                     let mut scan = index + 2;
                     while scan + 1 < chars.len() {
                         if chars[scan] == ch && chars[scan + 1] == ch {
                             let inner: String = chars[index + 2..scan].iter().collect();
-                            if turnip_core::text::str_width(&inner) + out.chars().count() <= width {
-                                out.push_str(&inner);
-                                index = scan + 2;
-                                consumed = true;
-                            }
+                            out.push_str(&inner);
+                            index = scan + 2;
                             break;
                         }
                         scan += 1;
                     }
+                    if index != start {
+                        continue;
+                    }
                 } else if let Some(end) = chars[index + 1..].iter().position(|c| *c == ch) {
                     let inner: String = chars[index + 1..index + 1 + end].iter().collect();
-                    if turnip_core::text::str_width(&inner) + out.chars().count() <= width {
-                        out.push_str(&inner);
-                        index += end + 2;
-                        consumed = true;
-                    }
-                }
-                if consumed {
+                    out.push_str(&inner);
+                    index += end + 2;
                     continue;
                 }
                 out.push(ch);
@@ -236,16 +224,18 @@ fn render_inline(text: &str, width: usize) -> String {
                 // [label](url) renders as label (url) until true links exist.
                 if let Some(close) = chars[index + 1..].iter().position(|c| *c == ']') {
                     if chars.get(index + close + 2) == Some(&'(') {
-                        if let Some(paren) = chars[index + close + 3..].iter().position(|c| *c == ')') {
-                            let label: String = chars[index + 1..index + 1 + close].iter().collect();
-                            let url: String =
-                                chars[index + close + 3..index + close + 3 + paren].iter().collect();
+                        if let Some(paren) =
+                            chars[index + close + 3..].iter().position(|c| *c == ')')
+                        {
+                            let label: String =
+                                chars[index + 1..index + 1 + close].iter().collect();
+                            let url: String = chars[index + close + 3..index + close + 3 + paren]
+                                .iter()
+                                .collect();
                             let rendered = format!("{label} ({url})");
-                            if turnip_core::text::str_width(&rendered) + out.chars().count() <= width {
-                                out.push_str(&rendered);
-                                index += close + paren + 4;
-                                continue;
-                            }
+                            out.push_str(&rendered);
+                            index += close + paren + 4;
+                            continue;
                         }
                     }
                 }
@@ -292,6 +282,39 @@ mod tests {
         assert_eq!(lines[2].text, "plain bold text");
         assert_eq!(lines[4].text, "• item one");
         assert_eq!(lines[7].text, "1. first");
+    }
+
+    #[test]
+    fn wraps_rendered_words_and_keeps_markdown_prefixes() {
+        let lines = render(
+            "# alpha beta gamma\none **two three**\n- alpha beta\n12. alpha beta\n> alpha beta",
+            10,
+        );
+        let text: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "alpha beta",
+                "gamma",
+                "one two",
+                "three",
+                "• alpha",
+                "  beta",
+                "12. alpha",
+                "    beta",
+                "│ alpha",
+                "│ beta"
+            ]
+        );
+        assert!(lines[..2].iter().all(|line| line.style.bold && line.style.accent));
+        assert!(lines[8..].iter().all(|line| line.style.dim));
+    }
+
+    #[test]
+    fn fenced_code_hard_wraps_without_dropping_spaces() {
+        let lines = render("```\nab cd ef\n```", 9);
+        assert_eq!(lines[1].text, "│ ab cd");
+        assert_eq!(lines[2].text, "│  ef");
     }
 
     #[test]
@@ -361,8 +384,8 @@ mod tests {
 
     #[test]
     fn inline_rendering_drops_markers() {
-        assert_eq!(render_inline("`code` and **bold**", 60), "code and bold");
-        assert_eq!(render_inline("[label](http://x)", 60), "label (http://x)");
-        assert_eq!(render_inline("a_b stays", 60), "a_b stays");
+        assert_eq!(render_inline("`code` and **bold**"), "code and bold");
+        assert_eq!(render_inline("[label](http://x)"), "label (http://x)");
+        assert_eq!(render_inline("a_b stays"), "a_b stays");
     }
 }
