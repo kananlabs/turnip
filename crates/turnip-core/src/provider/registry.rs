@@ -218,11 +218,11 @@ pub fn build(config: &Config, descriptor: &ProviderDescriptor, transport: HttpTr
 
     // API key: config block, then the def's environment variable.
     let api_key = provider_leaf(config, id, "api_key").or_else(|| {
-        let env = spec
+        let bare = spec
             .and_then(|s| s.api_key_env)
-            .map(|name| format!("TURNIP_{name}"))
-            .unwrap_or_else(|| format!("TURNIP_{}", id.to_ascii_uppercase().replace('-', "_")));
-        std::env::var(&env).ok().filter(|v| !v.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| id.to_ascii_uppercase().replace('-', "_"));
+        api_key_from_env(&bare)
     });
 
     let api = descriptor.api;
@@ -279,6 +279,38 @@ pub fn build(config: &Config, descriptor: &ProviderDescriptor, transport: HttpTr
     Some(Box::new(HttpProvider::new(endpoint, transport)))
 }
 
+/// Read an API key from the environment. The `TURNIP_`-prefixed name wins;
+/// the bare provider-declared name (e.g. `OPENROUTER_API_KEY`) is accepted
+/// as the portable fallback.
+fn api_key_from_env(bare: &str) -> Option<String> {
+    for name in [format!("TURNIP_{bare}"), bare.to_string()] {
+        if let Ok(value) = std::env::var(&name) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// A warning when an API key is being read from the bare provider-declared
+/// env var rather than the `TURNIP_`-prefixed one or a config block, so the
+/// selection stays explicit. None when nothing is worth reporting.
+pub fn bare_api_key_warning(config: &Config, descriptor: &ProviderDescriptor) -> Option<String> {
+    let env = descriptor.api_key_env.as_deref()?;
+    if provider_leaf(config, &descriptor.id, "api_key").is_some() {
+        return None;
+    }
+    let prefixed = format!("TURNIP_{env}");
+    if std::env::var(&prefixed).is_ok_and(|v| !v.is_empty()) {
+        return None;
+    }
+    if std::env::var(env).is_ok_and(|v| !v.is_empty()) {
+        return Some(format!("using {env}; set {prefixed} to be explicit"));
+    }
+    None
+}
+
 /// Whether a provider is usable right now. `Err(reason)` explains why not.
 /// Local servers are probed with a short request; keyed providers are
 /// available whenever their key is set.
@@ -297,7 +329,7 @@ pub fn availability(
         let url = format!("{base_url}/models");
         let mut headers = std::collections::BTreeMap::new();
         if let Some(env) = &descriptor.api_key_env {
-            if let Ok(key) = std::env::var(format!("TURNIP_{env}")) {
+            if let Some(key) = api_key_from_env(env) {
                 headers.insert("Authorization".into(), format!("Bearer {key}"));
             }
         }
@@ -310,12 +342,12 @@ pub fn availability(
     match &descriptor.api_key_env {
         Some(env) => {
             let var = format!("TURNIP_{env}");
-            if std::env::var(&var).map(|v| !v.is_empty()).unwrap_or(false)
+            if api_key_from_env(env).is_some()
                 || provider_leaf(config, &descriptor.id, "api_key").is_some()
             {
                 Ok(())
             } else {
-                Err(format!("{var} is not set"))
+                Err(format!("{var} (or {env}) is not set"))
             }
         }
         None => {

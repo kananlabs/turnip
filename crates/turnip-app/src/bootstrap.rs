@@ -111,6 +111,11 @@ impl App {
                 {
                     eprintln!("warning: {reason}");
                 }
+                if let Some(warning) =
+                    provider::registry::bare_api_key_warning(&self.config, &descriptor)
+                {
+                    eprintln!("warning: {warning}");
+                }
                 self.provider_descriptor = Some(descriptor.clone());
                 self.provider = provider::registry::build(&self.config, &descriptor, transport);
                 return;
@@ -118,6 +123,11 @@ impl App {
             eprintln!("warning: unknown provider '{name}'");
         }
         if let Some((descriptor, built)) = provider::registry::autoselect(&self.config, &transport) {
+            if let Some(warning) =
+                provider::registry::bare_api_key_warning(&self.config, &descriptor)
+            {
+                eprintln!("warning: {warning}");
+            }
             // Persist the selection so the next run starts here.
             self.provider_descriptor = Some(descriptor.clone());
             self.provider = Some(built);
